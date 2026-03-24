@@ -1365,7 +1365,7 @@ class Executor:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
         logger.info(f"payload shape: {payload.shape}")
-        from dinfer import TokenArray
+        from dinfer.decoding import TokenArray
 
         token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device, offset=[len(t) for t in tasks.tokens])
         logger.info(f"token_array shape: {token_array.data.shape}")
