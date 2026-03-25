@@ -1,9 +1,8 @@
-./script/srun_multi_node.sh 1 8 \
+./script/srun_multi_node.sh 1 1 \
     --master_port=22525 \
     -m chitu \
-    serve.port=21002 \
-    infer.pp_size=1 \
-    infer.tp_size=8 \
+    serve.port=21111 \
+    infer.tp_size=1 \
     infer.cache_type=paged \
     models=LLaDA2.0-mini \
     models.ckpt_dir=/data/nfs/LLaDA2.1-mini \

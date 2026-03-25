@@ -1236,6 +1236,7 @@ class Backend:
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
+                ModelType.LLADA2,
             }:
                 if Backend._support_layerwise_loading():
                     checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)
