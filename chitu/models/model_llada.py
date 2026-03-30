@@ -184,7 +184,7 @@ class TransformerLLaDA(nn.Module):
                 server_args=self.server_args,
                 max_length=self.max_length,
                 prefill_lengths=self.aligned_lengths,
-                enable_cuda_graph=True,
+                enable_cuda_graph=False,
                 supported_batch_sizes=self.supported_batch_sizes,
                 use_cross_block=False,
                 enable_compile=True,

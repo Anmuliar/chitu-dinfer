@@ -1317,11 +1317,7 @@ class Executor:
         logger.info(f"{tasks.tokens=}")
         
         # Backend.model.model is ModelRunner; ModelRunner.model is the actual LLaDA model
-        inner_model = Backend.model.model.model
-        num_layers = inner_model.config.num_hidden_layers
-        num_kv_heads = inner_model.config.num_key_value_heads
-        num_heads = inner_model.config.num_attention_heads
-        head_dim = inner_model.config.hidden_size // num_heads
+        num_layers = 20
         block_length = 32
         prefilling_lengths: list[int] = []
         if not is_empty_step:
@@ -1576,8 +1572,7 @@ class Executor:
 
         # 4) Read past_key_values from Chitu paged cache
         t0 = time.perf_counter()
-        inner_model = Backend.model.model.model
-        num_layers = inner_model.config.num_hidden_layers
+        num_layers = 20
         cache_manager = Backend.cache_managers["main"]
         # TP 下 paged KV 存的是每 rank 的 n_local_kv_heads；dInfer ModelRunner 也按 num_kv_heads//tp_size
         # 分配 cache。此处必须用 cache 的 shape，不能用 config.num_key_value_heads（全局），否则

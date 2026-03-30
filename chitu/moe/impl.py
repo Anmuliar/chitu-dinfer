@@ -423,9 +423,13 @@ class MoEImplNoEP(MoEImplBase):
             self.impl_map = {
                 TaskType.Prefill: "group_gemm_contiguous",
                 TaskType.Decode: "auto",
+                TaskType.PrefillDLLM: "auto",
+                TaskType.DecodeDLLM: "auto",
             }
         else:
             self.impl_map = {
                 TaskType.Prefill: "auto",
                 TaskType.Decode: "auto",
+                TaskType.PrefillDLLM: "auto",
+                TaskType.DecodeDLLM: "auto",
             }

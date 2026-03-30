@@ -85,7 +85,7 @@ class DLLMModelOutput:
 class DLLMModelRunner:
     """Wrapper class for dLLM model execution."""
 
-    def __init__(self, model: "TransformerLLaDAV2"):
+    def __init__(self, model: "TransformerLLaDA2"):
         self.model = model
         self.config = type('Config', (), {
             'num_hidden_layers': len(model.layers),
@@ -96,93 +96,161 @@ class DLLMModelRunner:
         input_ids: torch.Tensor,
         use_cache: bool = True,
         position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[torch.Tensor] = None,  # [num_layers, 2, batch, heads, seq, head_dim]
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> DLLMModelOutput:
-        """Forward pass for dLLM decode step."""
+        """Forward pass for dLLM decode step.
+
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            use_cache: Whether to return past_key_values
+            position_ids: Position IDs for RoPE
+            past_key_values: KV cache tensor [num_layers, 2, batch, heads, seq, head_dim] from previous steps
+            attention_mask: Attention mask for block-diagonal attention [batch, seq, seq]
+        """
         batch_size, block_length = input_ids.shape
         device = input_ids.device
 
-        # Get freqs_cis
+        # Get freqs_cis for RoPE
+        # position_ids: [batch_size, block_length] - each batch element has its own positions
+        # We need to flatten to [batch_size * block_length] for indexing the cos/sin cache
         if position_ids is not None:
-            pos_ids = position_ids[0]
+            # Flatten position_ids to get position for each token
+            pos_ids_flat = position_ids.reshape(-1)  # [batch_size * block_length]
         else:
-            pos_ids = torch.arange(block_length, device=device)
+            # Default: sequential positions starting from 0
+            pos_ids_flat = torch.arange(batch_size * block_length, device=device)
 
-        freqs_cis = BatchedFreqsCis(
-            self.model.rotary_emb.cos_cached[pos_ids],
-            self.model.rotary_emb.sin_cached[pos_ids],
-        )
+        # Index into the RoPE cache - each token gets its correct position embedding
+        cos_single = self.model.rotary_emb.cos_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]
+        sin_single = self.model.rotary_emb.sin_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]
+        freqs_cis = BatchedFreqsCis(cos_single, sin_single)
 
         # Embedding
         h = self.model.embed_tokens(input_ids)
         h = h.view(batch_size * block_length, -1)
 
         new_past_key_values = []
-
         for layer_idx, layer in enumerate(self.model.layers):
             # Attention
             normed = layer.input_layernorm(h, impl=get_rms_norm_impl())
-            xq, xk, xv = layer.self_attn._run_linear(normed)
+            
+            xq, xk, xv = layer.attention._run_linear(normed)
 
             # Get dimensions
-            n_local_heads = layer.self_attn.n_local_heads
-            n_local_kv_heads = layer.self_attn.n_local_kv_heads
-            head_dim = layer.self_attn.head_dim
+            n_local_heads = layer.attention.n_local_heads
+            n_local_kv_heads = layer.attention.n_local_kv_heads
+            head_dim = layer.attention.head_dim
 
-            # Reshape
-            xq = xq.view(-1, n_local_heads, head_dim)
-            xk = xk.view(-1, n_local_kv_heads, head_dim)
-            xv = xv.view(-1, n_local_kv_heads, head_dim)
+            # QK LayerNorm - apply before reshape, using 2D tensor
+            # dInfer approach: q_by_head = q.reshape(-1, self.head_dim)
+            # This ensures the tensor is contiguous for Triton RMSNorm
+            if hasattr(layer.attention, "query_layernorm"):
+                # xq is [batch * seq, heads * head_dim], reshape to [batch * seq * heads, head_dim]
+                # Use reshape() instead of view() since xq from split() may not be contiguous
+                xq_flat = xq.reshape(-1, head_dim)
+                xq_flat = layer.attention.query_layernorm(xq_flat)
+                 # layernorm output is contiguous, so view() is safe
+                xq = xq_flat.view(-1, n_local_heads * head_dim)
 
-            # QK LayerNorm
-            if hasattr(layer.self_attn, "query_layernorm"):
-                xq = layer.self_attn.query_layernorm(xq)
-            if hasattr(layer.self_attn, "key_layernorm"):
-                xk = layer.self_attn.key_layernorm(xk)
+            if hasattr(layer.attention, "key_layernorm"):
+                # xk is [batch * seq, kv_heads * head_dim], reshape to [batch * seq * kv_heads, head_dim]
+                # Use reshape() instead of view() since xk from split() may not be contiguous
+                xk_flat = xk.reshape(-1, head_dim)
+                xk_flat = layer.attention.key_layernorm(xk_flat)
 
-            # Apply RoPE
-            xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type="separated")
+                # layernorm output is contiguous, so view() is safe
+                xk = xk_flat.view(-1, n_local_kv_heads * head_dim)
+
+            # Now reshape to [batch, seq, heads, head_dim] for RoPE
+            xq = xq.view(batch_size, -1, n_local_heads, head_dim)
+            xk = xk.view(batch_size, -1, n_local_kv_heads, head_dim)
+            xv = xv.view(batch_size, -1, n_local_kv_heads, head_dim)
+
+            # Apply RoPE (expects [batch, seq, heads, head_dim] or [seq*batch, heads, head_dim])
+            # Need to transpose to [batch*seq, heads, head_dim] for apply_rotary_pos_emb
+            xq_flat = xq.view(-1, n_local_heads, head_dim)
+            xk_flat = xk.view(-1, n_local_kv_heads, head_dim)
+            
+            xq_flat, xk_flat = apply_rotary_pos_emb(xq_flat, xk_flat, freqs_cis, rotary_type="separated-half")
+            
+            xq = xq_flat.view(batch_size, -1, n_local_heads, head_dim)
+            xk = xk_flat.view(batch_size, -1, n_local_kv_heads, head_dim)
 
             # Reshape for cache: [batch, heads, seq, head_dim]
-            xk = xk.view(batch_size, block_length, n_local_kv_heads, head_dim).transpose(1, 2)
-            xv = xv.view(batch_size, block_length, n_local_kv_heads, head_dim).transpose(1, 2)
+            xk = xk.transpose(1, 2)
+            xv = xv.transpose(1, 2)
 
-            # Concatenate with past KV
-            if past_key_values is not None and layer_idx < len(past_key_values):
-                pk, pv = past_key_values[layer_idx]
-                k = torch.cat([pk, xk], dim=2)
-                v = torch.cat([pv, xv], dim=2)
+            # KV Cache replacement mode for dLLM iterative decoding
+            # dInfer uses slice_scatter to replace KV at specific positions
+            # CRITICAL: Replace the last block_length positions in the cache                     
+            # This is how dLLM works - iterative refinement replaces the last block              
+            # past_key_values shape: [num_layers, 2, batch_size, num_kv_heads, seq_len, head_dim]
+            if past_key_values is not None:                                                      
+                cache_k = past_key_values[layer_idx, 0]  # [batch, heads, seq, head_dim]         
+                cache_v = past_key_values[layer_idx, 1]  # [batch, heads, seq, head_dim]         
+                cache_length = cache_k.shape[2]  # Total cache length                            
+                block_length = xk.shape[2]       # Current block length                                    
+
+                # Use slice_scatter to replace the last block_length positions
+                # This matches dInfer's behavior                                                     
+                k = cache_k.slice_scatter(xk, dim=2, start=cache_length - block_length, end=cache_length)
+                v = cache_v.slice_scatter(xv, dim=2, start=cache_length - block_length, end=cache_length)
             else:
                 k = xk
                 v = xv
 
-            new_past_key_values.append((k, v))
+            new_past_key_values.extend((k, v))
 
-            # Handle GQA
+            # 1. Reshape Q for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
+            xq = xq.transpose(1, 2)
+
+            # 2. Handle GQA: repeat K and V if needed
             if n_local_heads != n_local_kv_heads:
                 n_rep = n_local_heads // n_local_kv_heads
                 k = k.repeat_interleave(n_rep, dim=1)
                 v = v.repeat_interleave(n_rep, dim=1)
 
-            # Attention
-            xq = xq.view(batch_size, block_length, n_local_heads, head_dim).transpose(1, 2)
+            # 3. Attention with bidirectional (non-causal) mask
+            # LLaDA is a bidirectional model, so is_causal=False
+            # This is critical: LLaDA uses bidirectional attention, not causal!
+            # Process attention_mask if provided (for block-diagonal attention)
+            current_attn_mask = None
+            if attention_mask is not None:
+                # attention_mask shape: [batch, seq, seq] -> need [batch, 1, seq, seq] for SDPA
+                if len(attention_mask.shape) == 3:
+                    current_attn_mask = attention_mask.unsqueeze(1)
+                else:
+                    current_attn_mask = attention_mask
             scale = 1.0 / (head_dim ** 0.5)
-            attn_weights = torch.matmul(xq, k.transpose(-2, -1)) * scale
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_output = torch.matmul(attn_weights, v)
 
+            attn_output = F.scaled_dot_product_attention(
+                xq, k, v,
+                attn_mask=current_attn_mask,
+                dropout_p=0.0,
+                is_causal=False,  # Bidirectional attention for dLLM
+                scale=scale,
+            )
+
+            # 4. Reshape output and apply output projection
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size * block_length, -1)
-            attn_output = layer.self_attn._run_output_linear(attn_output)
-
+            
+            attn_output = layer.attention._run_output_linear(attn_output)
+            
             # Residual
             h = h + attn_output
-
             # FFN/MoE
-            h = h + layer.mlp(layer.post_attention_layernorm(h, impl=get_rms_norm_impl()))
+            mlp_out = layer.mlp(layer.post_attention_layernorm(h, impl=get_rms_norm_impl()))
+
+            
+            h = h + mlp_out
 
         # Output projection
         h = h.view(batch_size * block_length, -1)
         logits = self.model.lm_head(self.model.norm(h, impl=get_rms_norm_impl()))
+        # Reshape to [batch_size, block_length, vocab_size] for 3D indexing in executor
+
+        logits = logits.view(batch_size, block_length, -1)
 
         return DLLMModelOutput(logits=logits, past_key_values=new_past_key_values)
 
@@ -202,7 +270,7 @@ class AttentionLLaDA2(AttentionHFLlama):
         layer_id,
         cache,
         attn_backend,
-        rotary_type="separated",
+        rotary_type="separated-half",
         op_impl: str = "torch",
         checkpoint_prefix="",
     ):
@@ -244,12 +312,12 @@ class AttentionLLaDA2(AttentionHFLlama):
         self.query_layernorm = RMSNorm(
             self.head_dim,
             eps=args.norm_eps,
-            dtype=parse_dtype(args.rms_norm_dtype) if hasattr(args, "rms_norm_dtype") else None,
+            dtype=torch.float32,
         )
         self.key_layernorm = RMSNorm(
             self.head_dim,
             eps=args.norm_eps,
-            dtype=parse_dtype(args.rms_norm_dtype) if hasattr(args, "rms_norm_dtype") else None,
+            dtype=torch.float32,
         )
 
         # Output projection (named dense in checkpoint)
@@ -287,11 +355,11 @@ class LLaDA2MoeGate(MoeGate):
             op_impl,
             params.dim,
             topk=getattr(params, "num_experts_per_tok", 1),
-            n_groups=1,
-            topk_groups=1,
-            topk_as_topk_group_criteria=None,
-            score_func="softmax",
-            route_scale=1,
+            n_groups=params.n_group,
+            topk_groups=params.topk_group,
+            topk_as_topk_group_criteria=2,
+            score_func="sigmoid",
+            route_scale=params.routed_scaling_factor,
             n_experts=params.num_experts,
             bias=None,
             e_score_correction_bias=None,
@@ -303,47 +371,53 @@ class LLaDA2MoeGate(MoeGate):
         self.top_k = params.num_experts_per_tok
         self.topk_group = params.topk_group
         self.num_experts = params.num_experts
-        self.expert_bias = nn.Parameter(torch.zeros(params.num_experts, dtype=torch.bfloat16), requires_grad=False)
+        self.expert_bias = nn.Parameter(torch.zeros(params.num_experts, dtype=torch.float32), requires_grad=False)
 
-    def group_limited_topk(
-        self,
-        scores: torch.Tensor,
-    ):
-        num_tokens, _ = scores.size()
-        # Organize the experts into groups
-        group_scores = scores.view(num_tokens, self.n_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-
-        # Mask the experts based on selection groups
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(num_tokens, self.n_group, self.num_experts // self.n_group)
-            .reshape(num_tokens, -1)
-        )
-
-        masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
-        probs, top_indices = torch.topk(masked_scores, k=self.top_k, dim=-1)
-
-        return probs, top_indices
-    
     def forward(self, hidden_states):
-        # compute gating score
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        self.e_score_correction_bias = self.expert_bias
+        return super().forward(hidden_states)
+        ...
+        
 
-        scores = torch.sigmoid(logits.float()).type_as(logits)
+    # def group_limited_topk(
+    #     self,
+    #     scores: torch.Tensor,
+    # ):
+    #     num_tokens, _ = scores.size()
+    #     # Organize the experts into groups
+    #     group_scores = scores.view(num_tokens, self.n_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    #     group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+    #     group_mask = torch.zeros_like(group_scores)
+    #     group_mask.scatter_(1, group_idx, 1)
 
-        scores_for_routing = scores + self.expert_bias
-        _, topk_idx = self.group_limited_topk(scores_for_routing)
+    #     # Mask the experts based on selection groups
+    #     score_mask = (
+    #         group_mask.unsqueeze(-1)
+    #         .expand(num_tokens, self.n_group, self.num_experts // self.n_group)
+    #         .reshape(num_tokens, -1)
+    #     )
 
-        scores = torch.gather(scores, dim=1, index=topk_idx).type_as(logits)
+    #     masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
+    #     probs, top_indices = torch.topk(masked_scores, k=self.top_k, dim=-1)
 
-        topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
-        topk_weight = topk_weight * self.routed_scaling_factor
+    #     return probs, top_indices
+    
+    # def forward(self, hidden_states):
+    #     # compute gating score
+    #     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    #     logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
 
-        return topk_weight, topk_idx
+    #     scores = torch.sigmoid(logits.float()).type_as(logits)
+
+    #     scores_for_routing = scores + self.expert_bias
+    #     _, topk_idx = self.group_limited_topk(scores_for_routing)
+
+    #     scores = torch.gather(scores, dim=1, index=topk_idx).type_as(logits)
+
+    #     topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
+    #     # topk_weight = topk_weight * self.routed_scaling_factor
+
+    #     return topk_weight, topk_idx
 
 class MLPLLaDA2(nn.Module):
     """
@@ -644,13 +718,13 @@ class TransformerLLaDA2(TransformerHFLlama):
         tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
-        rotary_type: str = "separated",
+        rotary_type: str = "separated-half",
         layer_type: Optional[type] = None,
         layer_type_callback: Optional[Callable[[int], type]] = None,
         **kvargs,
     ):
         # dLLM-specific parameters
-        self.mask_id = getattr(params, "mask_id", 126336)
+        self.mask_id = getattr(params, "mask_id", 156895)
         self.eos_id = getattr(params, "eos_id", 126081)
         self.block_length = getattr(params, "block_length", 32)
         self.threshold = getattr(params, "threshold", 0.9)
