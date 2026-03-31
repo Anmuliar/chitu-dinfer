@@ -366,58 +366,11 @@ class LLaDA2MoeGate(MoeGate):
             norm_prob=getattr(params, "norm_topk_prob", False),
             n_fused_shared_experts=0,
         )
-        self.n_group = params.n_group
-        self.routed_scaling_factor = params.routed_scaling_factor
-        self.top_k = params.num_experts_per_tok
-        self.topk_group = params.topk_group
-        self.num_experts = params.num_experts
         self.expert_bias = nn.Parameter(torch.zeros(params.num_experts, dtype=torch.float32), requires_grad=False)
 
     def forward(self, hidden_states):
         self.e_score_correction_bias = self.expert_bias
         return super().forward(hidden_states)
-        ...
-        
-
-    # def group_limited_topk(
-    #     self,
-    #     scores: torch.Tensor,
-    # ):
-    #     num_tokens, _ = scores.size()
-    #     # Organize the experts into groups
-    #     group_scores = scores.view(num_tokens, self.n_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
-    #     group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-    #     group_mask = torch.zeros_like(group_scores)
-    #     group_mask.scatter_(1, group_idx, 1)
-
-    #     # Mask the experts based on selection groups
-    #     score_mask = (
-    #         group_mask.unsqueeze(-1)
-    #         .expand(num_tokens, self.n_group, self.num_experts // self.n_group)
-    #         .reshape(num_tokens, -1)
-    #     )
-
-    #     masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
-    #     probs, top_indices = torch.topk(masked_scores, k=self.top_k, dim=-1)
-
-    #     return probs, top_indices
-    
-    # def forward(self, hidden_states):
-    #     # compute gating score
-    #     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    #     logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-
-    #     scores = torch.sigmoid(logits.float()).type_as(logits)
-
-    #     scores_for_routing = scores + self.expert_bias
-    #     _, topk_idx = self.group_limited_topk(scores_for_routing)
-
-    #     scores = torch.gather(scores, dim=1, index=topk_idx).type_as(logits)
-
-    #     topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
-    #     # topk_weight = topk_weight * self.routed_scaling_factor
-
-    #     return topk_weight, topk_idx
 
 class MLPLLaDA2(nn.Module):
     """
@@ -814,10 +767,6 @@ class TransformerLLaDA2(TransformerHFLlama):
         return mappings
 
     @override
-    def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
-        return (f"model.layers.{i}.", f"layers.{i}.")
-
-    @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
         """Process checkpoint to merge expert weights for MoE layers."""
         if not hasattr(self.params, 'num_experts'):
@@ -881,9 +830,6 @@ class TransformerLLaDA2(TransformerHFLlama):
             has_bias=False,
             checkpoint_prefix="lm_head",
         )
-
-    def _pre_layers(self, h, **args):
-        return self.embed_tokens(h)
 
     def _post_layers(self, h):
         h = self.norm(h, impl=get_rms_norm_impl())
