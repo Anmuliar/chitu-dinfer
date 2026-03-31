@@ -35,9 +35,9 @@ import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
-from chitu.attn_backend import AttnBackend
+from chitu.attn_backend import AttnBackend, DLLMAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.cache_manager import KVCacheManagerBase, DenseKVCacheAccessor
 from chitu.dllm.decoder import DLLMDecoder
 from chitu.models.model import MoeGate, ParallelMoeBlock, RMSNorm, TransformerBlock, get_linear_layout_contig_y
 from chitu.models.model_hf_llama import (
@@ -90,6 +90,8 @@ class DLLMModelRunner:
         self.config = type('Config', (), {
             'num_hidden_layers': len(model.layers),
         })()
+        # Initialize DLLM attention backend
+        self.dllm_backend = DLLMAttnBackend()
 
     def __call__(
         self,
@@ -214,23 +216,22 @@ class DLLMModelRunner:
             # 3. Attention with bidirectional (non-causal) mask
             # LLaDA is a bidirectional model, so is_causal=False
             # This is critical: LLaDA uses bidirectional attention, not causal!
-            # Process attention_mask if provided (for block-diagonal attention)
-            current_attn_mask = None
-            if attention_mask is not None:
-                # attention_mask shape: [batch, seq, seq] -> need [batch, 1, seq, seq] for SDPA
-                if len(attention_mask.shape) == 3:
-                    current_attn_mask = attention_mask.unsqueeze(1)
-                else:
-                    current_attn_mask = attention_mask
             scale = 1.0 / (head_dim ** 0.5)
 
-            attn_output = F.scaled_dot_product_attention(
-                xq, k, v,
-                attn_mask=current_attn_mask,
-                dropout_p=0.0,
-                is_causal=False,  # Bidirectional attention for dLLM
-                scale=scale,
-            )
+            # Use DLLMAttnBackend for attention
+            if attention_mask is not None:
+                # Block-diagonal attention with custom mask (prefill phase)
+                attn_output = self.dllm_backend.bidirectional_prefill_with_mask(
+                    xq, k, v,
+                    attention_mask=attention_mask,
+                    softmax_scale=scale,
+                )
+            else:
+                # Simple bidirectional attention (decode phase or prefill without mask)
+                attn_output = self.dllm_backend.decode_bidirectional_simple(
+                    xq, k, v,
+                    softmax_scale=scale,
+                )
 
             # 4. Reshape output and apply output projection
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size * block_length, -1)
@@ -312,12 +313,12 @@ class AttentionLLaDA2(AttentionHFLlama):
         self.query_layernorm = RMSNorm(
             self.head_dim,
             eps=args.norm_eps,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
         )
         self.key_layernorm = RMSNorm(
             self.head_dim,
             eps=args.norm_eps,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
         )
 
         # Output projection (named dense in checkpoint)

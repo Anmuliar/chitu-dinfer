@@ -313,7 +313,6 @@ class Scheduler:
         # scheduling prefill tasks
         if is_prefill(filter_task_type):
             prefill_task_ids = self._schedule_prefill_tasks(task_ids)
-            logger.info(f"fount prefill tasks, prefill_task_ids: {prefill_task_ids}")
             if prefill_task_ids:
                 task_ids = prefill_task_ids[: self.prefill_num_tasks]
             else:
