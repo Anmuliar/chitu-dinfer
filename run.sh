@@ -7,6 +7,7 @@
     models=LLaDA2.0-mini \
     models.ckpt_dir=/data/nfs/LLaDA2.1-mini \
     infer.use_cuda_graph=True \
+    infer.attn_type=dllm \
     infer.max_reqs=16 \
     infer.max_seq_len=1200 \
     request.max_new_tokens=1024 \

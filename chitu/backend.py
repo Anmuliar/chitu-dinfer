@@ -29,6 +29,7 @@ from chitu.attn_backend import (
     TritonAttnBackend,
     NpuAttnBackend,
     HybridAttnBackend,
+    DLLMAttnBackend,
 )
 from chitu.cache_manager import (
     DenseKVCacheManager,
@@ -928,6 +929,8 @@ class Backend:
             return FlashMLABackend
         elif args.infer.attn_type == "flash_infer":
             return FlashInferBackend
+        elif args.infer.attn_type == "dllm":
+            return DLLMAttnBackend
         elif args.infer.attn_type == "triton":
             return TritonAttnBackend
         elif args.infer.attn_type == "npu":

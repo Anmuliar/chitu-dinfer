@@ -334,7 +334,6 @@ class UserRequest:
             tokens = Backend.formatter.encode_dialog_prompt(
                 self.message, chat_template_kwargs=self.chat_template_kwargs
             )
-            logger.info(f"tokens: {tokens}")
             if isinstance(tokens, tuple):
                 self.tokens = tokens[0]
                 self.pixel_values = tokens[1]
