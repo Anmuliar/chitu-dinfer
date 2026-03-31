@@ -8,5 +8,6 @@ This module provides independent implementation of dLLM inference within chitu f
 """
 
 from chitu.dllm.decoder import DLLMDecoder, add_gumbel_noise
+from chitu.dllm.utils import TokenArray
 
 __all__ = ["DLLMDecoder", "add_gumbel_noise"]

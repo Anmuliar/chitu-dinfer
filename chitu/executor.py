@@ -1347,7 +1347,7 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
-        from dinfer.decoding import TokenArray
+        from chitu.dllm import TokenArray
         token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device, offset=[len(t) for t in tasks.tokens])
 
         # Only main rank (rank 0) updates task.decoding_start; worker ranks have PackedTasksBase
