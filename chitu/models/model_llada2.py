@@ -172,6 +172,68 @@ class AttentionLLaDA2(AttentionHFLlama):
         """Output projection."""
         return self.dense(x)
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        attention_mask: Optional[torch.Tensor] = None,
+        is_mtp: bool = False,
+    ) -> torch.Tensor:
+        """
+        Forward pass for LLaDA2 attention.
+
+        Args:
+            x: Input tensor [batch * seq, hidden_dim]
+            freqs_cis: RoPE embeddings
+            attention_mask: Optional attention mask for prefill phase [batch, seq, seq]
+            is_mtp: Whether this is MTP (Multi-Token Prediction) mode
+
+        Returns:
+            Output tensor after attention
+        """
+        # Run QKV projection
+        xq, xk, xv = self._run_linear(x)
+
+        # Get batch dimensions
+        bs_seq = xq.numel() // xq.shape[-1]
+        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
+        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+
+        # QK LayerNorm - apply before reshape
+        # Reshape to [batch * seq * heads, head_dim] for RMSNorm
+        xq_flat = xq.reshape(-1, self.head_dim)
+        xq_flat = self.query_layernorm(xq_flat)
+        xq = xq_flat.view(-1, self.n_local_heads, self.head_dim)
+
+        xk_flat = xk.reshape(-1, self.head_dim)
+        xk_flat = self.key_layernorm(xk_flat)
+        xk = xk_flat.view(-1, self.n_local_kv_heads, self.head_dim)
+
+        # Apply RoPE
+        xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
+
+        # Get seq_len_delta from cache manager
+
+        seq_len_delta = self.cache.seq_len_delta
+
+        # Call attention backend with standard interface
+        # For dLLM, we pass attention_mask and layer_id through kwargs
+        output = self.attn_backend(
+            xq,
+            self.cache.get_accessor(self.layer_id),
+            xk,
+            xv,
+            seq_len_delta=seq_len_delta,
+            causal=False,  # Bidirectional attention for dLLM
+            layer_id=self.layer_id,
+            attention_mask=attention_mask,
+        )
+
+        # Apply output projection
+        output = output.view(bs_seq, -1)
+        return self._run_output_linear(output).reshape(x.shape)
+
 
 class LLaDA2MoeGate(MoeGate):
     """MoE Gate for LLaDA2"""
@@ -655,164 +717,65 @@ class TransformerLLaDA2(TransformerHFLlama):
     def get_decoder(self) -> DLLMDecoder:
         """Get the dLLM decoder instance."""
         return self.decoder
-    
-                                                                                                              
+
     def forward(
-        self,                                                                                                 
+        self,
         input_ids: torch.Tensor,
         use_cache: bool = True,
-        position_ids: Optional[torch.Tensor] = None,                                                          
-        past_key_values: Optional[torch.Tensor] = None,                                                       
-        attention_mask: Optional[torch.Tensor] = None,                                                        
-    ) -> DLLMModelOutput:                                                                                     
-        """Forward pass for dLLM prefill/decode step.                                                         
-                                                                                                              
-        Args:                                                                                                 
-            input_ids: Input token IDs [batch_size, seq_len]                                                  
-            use_cache: Whether to return past_key_values                                                      
-            position_ids: Position IDs for RoPE [batch_size, seq_len]                                         
-            past_key_values: KV cache tensor [num_layers, 2, batch, heads, seq, head_dim] from previous steps 
-            attention_mask: Attention mask for block-diagonal attention [batch, seq, seq]                     
-        """                                                                                                   
-        batch_size, block_length = input_ids.shape                                                            
-        device = input_ids.device                                                                             
-                                                                                                              
-        # Get freqs_cis for RoPE                                                                              
-        # position_ids: [batch_size, block_length] - each batch element has its own positions                 
-        # We need to flatten to [batch_size * block_length] for indexing the cos/sin cache                    
-        if position_ids is not None:                                                                          
-            # Flatten position_ids to get position for each token                                             
-            pos_ids_flat = position_ids.reshape(-1)  # [batch_size * block_length]                            
-        else:                                                                                                 
-            # Default: sequential positions starting from 0                                                   
-            pos_ids_flat = torch.arange(batch_size * block_length, device=device)                             
-                                                                                                              
-        # Index into the RoPE cache - each token gets its correct position embedding                          
-        cos_single = self.rotary_emb.cos_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]        
-        sin_single = self.rotary_emb.sin_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]        
-        freqs_cis = BatchedFreqsCis(cos_single, sin_single)                                                   
-                                                                                                              
-        # Embedding                                                                                           
-        h = self.embed_tokens(input_ids)                                                                      
-        h = h.view(batch_size * block_length, -1)                                                             
-                                                                                                              
-        new_past_key_values = []                                                                              
-        for layer_idx, layer in enumerate(self.layers):                                                       
-            # Attention                                                                                       
-            normed = layer.input_layernorm(h, impl=get_rms_norm_impl())                                       
-                                                                                                              
-            xq, xk, xv = layer.attention._run_linear(normed)                                                  
-                                                                                                              
-            # Get dimensions                                                                                  
-            n_local_heads = layer.attention.n_local_heads                                                     
-            n_local_kv_heads = layer.attention.n_local_kv_heads                                               
-            head_dim = layer.attention.head_dim                                                               
-                                                                                                              
-            # QK LayerNorm - apply before reshape, using 2D tensor                                            
-            # dInfer approach: q_by_head = q.reshape(-1, self.head_dim)                                       
-            # This ensures the tensor is contiguous for Triton RMSNorm                                        
-            if hasattr(layer.attention, "query_layernorm"):                                                   
-                # xq is [batch * seq, heads * head_dim], reshape to [batch * seq * heads, head_dim]           
-                # Use reshape() instead of view() since xq from split() may not be contiguous                 
-                xq_flat = xq.reshape(-1, head_dim)                                                            
-                xq_flat = layer.attention.query_layernorm(xq_flat)                                            
-                 # layernorm output is contiguous, so view() is safe                                          
-                xq = xq_flat.view(-1, n_local_heads * head_dim)                                               
-                                                                                                              
-            if hasattr(layer.attention, "key_layernorm"):                                                     
-                # xk is [batch * seq, kv_heads * head_dim], reshape to [batch * seq * kv_heads, head_dim]     
-                # Use reshape() instead of view() since xk from split() may not be contiguous                 
-                xk_flat = xk.reshape(-1, head_dim)                                                            
-                xk_flat = layer.attention.key_layernorm(xk_flat)                                              
-                                                                                                              
-                # layernorm output is contiguous, so view() is safe                                           
-                xk = xk_flat.view(-1, n_local_kv_heads * head_dim)                                            
-                                                                                                              
-            # Now reshape to [batch, seq, heads, head_dim] for RoPE                                           
-            xq = xq.view(batch_size, -1, n_local_heads, head_dim)                                             
-            xk = xk.view(batch_size, -1, n_local_kv_heads, head_dim)                                          
-            xv = xv.view(batch_size, -1, n_local_kv_heads, head_dim)                                          
-                                                                                                              
-            # Apply RoPE (expects [batch, seq, heads, head_dim] or [seq*batch, heads, head_dim])              
-            # Need to transpose to [batch*seq, heads, head_dim] for apply_rotary_pos_emb                      
-            xq_flat = xq.view(-1, n_local_heads, head_dim)                                                    
-            xk_flat = xk.view(-1, n_local_kv_heads, head_dim)                                                 
-                                                                                                              
-            xq_flat, xk_flat = apply_rotary_pos_emb(xq_flat, xk_flat, freqs_cis, rotary_type="separated-half")
-                                                                                                              
-            xq = xq_flat.view(batch_size, -1, n_local_heads, head_dim)                                        
-            xk = xk_flat.view(batch_size, -1, n_local_kv_heads, head_dim)                                     
-                                                                                                              
-            # Reshape for cache: [batch, heads, seq, head_dim]                                                
-            xk = xk.transpose(1, 2)                                                                           
-            xv = xv.transpose(1, 2)                                                                           
-                                                                                                              
-            # KV Cache replacement mode for dLLM iterative decoding                                           
-            # dInfer uses slice_scatter to replace KV at specific positions                                   
-            # CRITICAL: Replace the last block_length positions in the cache                                  
-            # This is how dLLM works - iterative refinement replaces the last block                           
-            # past_key_values shape: [num_layers, 2, batch_size, num_kv_heads, seq_len, head_dim]             
-            if past_key_values is not None:                                                                   
-                cache_k = past_key_values[layer_idx, 0]  # [batch, heads, seq, head_dim]                      
-                cache_v = past_key_values[layer_idx, 1]  # [batch, heads, seq, head_dim]                      
-                cache_length = cache_k.shape[2]  # Total cache length                                         
-                block_length_cur = xk.shape[2]       # Current block length                                   
-                                                                                                              
-                # Use slice_scatter to replace the last block_length positions                                
-                # This matches dInfer's behavior                                                              
-                k = cache_k.slice_scatter(xk, dim=2, start=cache_length - block_length_cur, end=cache_length) 
-                v = cache_v.slice_scatter(xv, dim=2, start=cache_length - block_length_cur, end=cache_length) 
-            else:                                                                                             
-                k = xk                                                                                        
-                v = xv                                                                                        
-                                                                                                              
-            new_past_key_values.extend((k, v))                                                                
-                                                                                                              
-            # 1. Reshape Q for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]      
-            xq = xq.transpose(1, 2)                                                                           
-                                                                                                              
-            # 2. Handle GQA: repeat K and V if needed                                                         
-            if n_local_heads != n_local_kv_heads:                                                             
-                n_rep = n_local_heads // n_local_kv_heads                                                     
-                k = k.repeat_interleave(n_rep, dim=1)                                                         
-                v = v.repeat_interleave(n_rep, dim=1)                                                         
-                                                                                                              
-            # 3. Attention with bidirectional (non-causal) mask                                               
-            # LLaDA is a bidirectional model, so is_causal=False                                              
-            # This is critical: LLaDA uses bidirectional attention, not causal!                               
-            scale = 1.0 / (head_dim ** 0.5)                                                                   
-                                                                                                              
-            # Use attn_backend for attention (assumed to be DLLMAttnBackend)                                  
-            if attention_mask is not None:                                                                    
-                # Block-diagonal attention with custom mask (prefill phase)                                   
-                attn_output = self.attn_backend.bidirectional_prefill_with_mask(                              
-                    xq, k, v,                                                                                 
-                    attention_mask=attention_mask,                                                            
-                    softmax_scale=scale,                                                                      
-                )                                                                                             
-            else:                                                                                             
-                # Simple bidirectional attention (decode phase or prefill without mask)                       
-                attn_output = self.attn_backend.decode_bidirectional_simple(                                  
-                    xq, k, v,                                                                                 
-                    softmax_scale=scale,                                                                      
-                )                                                                                             
-                                                                                                              
-            # 4. Reshape output and apply output projection                                                   
-            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size * block_length, -1)        
-                                                                                                              
-            attn_output = layer.attention._run_output_linear(attn_output)                                     
-                                                                                                              
-            # Residual                                                                                        
-            h = h + attn_output                                                                               
-            # FFN/MoE                                                                                         
-            mlp_out = layer.mlp(layer.post_attention_layernorm(h, impl=get_rms_norm_impl()))                  
-                                                                                                              
-                                                                                                              
-            h = h + mlp_out                                                                                   
-                                                                                                                                                                                                
-        h = h.view(batch_size * block_length, -1)                                                             
-        logits = self.lm_head(self.norm(h, impl=get_rms_norm_impl()))                                         
-        # Reshape to [batch_size, block_length, vocab_size] for 3D indexing in executor                                                                                                                         
-        logits = logits.view(batch_size, block_length, -1)                                                    
-                                                                                                              
-        return DLLMModelOutput(logits=logits, past_key_values=new_past_key_values)                            
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> DLLMModelOutput:
+        """Forward pass for dLLM prefill/decode step.
+
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            use_cache: Whether to use KV cache (handled internally by attn_backend)
+            position_ids: Position IDs for RoPE [batch_size, seq_len]
+            attention_mask: Attention mask for block-diagonal attention [batch, seq, seq]
+        """
+        batch_size, block_length = input_ids.shape
+        device = input_ids.device
+
+        # Get freqs_cis for RoPE
+        # position_ids: [batch_size, block_length] - each batch element has its own positions
+        # We need to flatten to [batch_size * block_length] for indexing the cos/sin cache
+        if position_ids is not None:
+            # Flatten position_ids to get position for each token
+            pos_ids_flat = position_ids.reshape(-1)  # [batch_size * block_length]
+        else:
+            # Default: sequential positions starting from 0
+            pos_ids_flat = torch.arange(batch_size * block_length, device=device)
+
+        # Index into the RoPE cache - each token gets its correct position embedding
+        cos_single = self.rotary_emb.cos_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]
+        sin_single = self.rotary_emb.sin_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]
+        freqs_cis = BatchedFreqsCis(cos_single, sin_single)
+
+        # Embedding
+        h = self.embed_tokens(input_ids)
+        h = h.view(batch_size * block_length, -1)
+
+        # Process through transformer layers
+        for layer in self.layers:
+            # Use standard attention interface
+            # KV cache handling is done internally by DLLMAttnBackend
+            normed = layer.input_layernorm(h, impl=get_rms_norm_impl())
+            attn_output = layer.attention(normed, freqs_cis, attention_mask=attention_mask)
+            h = h + attn_output
+
+            # FFN/MoE
+            h = h + layer.mlp(layer.post_attention_layernorm(h, impl=get_rms_norm_impl()))
+
+        # Output projection
+        h = h.view(batch_size * block_length, -1)
+        logits = self.lm_head(self.norm(h, impl=get_rms_norm_impl()))
+        # Reshape to [batch_size, block_length, vocab_size] for 3D indexing in executor
+        logits = logits.view(batch_size, block_length, -1)
+
+        # 收集 decode 阶段的 past_key_values（存储在 attn_backend 中）
+        past_key_values = None
+        if self.attn_backend._decode_kv_cache is not None:
+            past_key_values = self.attn_backend._decode_kv_cache
+            self.attn_backend._decode_kv_cache = None  # 重置
+
+        return DLLMModelOutput(logits=logits, past_key_values=past_key_values)
