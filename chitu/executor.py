@@ -1560,60 +1560,9 @@ class Executor:
 
         # 9) Write back KV to cache for block_finished
         if block_finished.any() and output.past_key_values is not None:
-            num_layers = len(output.past_key_values)
-            for layer_id, (layer_k, layer_v) in enumerate(output.past_key_values):
-                for mgr in Backend.cache_managers.values():
-                    try:
-                        accessor = mgr.get_accessor(layer_id)
-                    except KeyError:
-                        continue
-
-                    # 只写入 block_finished 的 batch
-                    finished_indices = [i for i, f in enumerate(block_finished_list) if f]
-                    if not finished_indices:
-                        continue
-
-                    # layer_k, layer_v: [batch * block_len, n_kv_heads, head_dim]
-                    n_kv_heads = layer_k.shape[1]
-                    head_dim = layer_k.shape[2]
-
-                    # 提取已完成 batch 的 K、V
-                    finished_k = layer_k.view(batch_size, block_length, n_kv_heads, head_dim)[finished_indices]
-                    finished_v = layer_v.view(batch_size, block_length, n_kv_heads, head_dim)[finished_indices]
-
-                    # 构建 position_ids 和 seq_ids
-                    delta_pos_list = []
-                    delta_seq_list = []
-                    for new_idx, orig_idx in enumerate(finished_indices):
-                        ds = decoding_start_list[orig_idx]
-                        delta_pos_list.extend(range(ds, ds + block_length))
-                        delta_seq_list.extend([new_idx] * block_length)
-
-                    delta_position_ids = torch.tensor(delta_pos_list, device=self.device, dtype=torch.long)
-                    delta_seq_ids = torch.tensor(delta_seq_list, device=self.device, dtype=torch.long)
-
-                    # 写入 K
-                    append_to_paged_kv_cache(
-                        accessor.k,
-                        accessor.block_table,
-                        finished_k.reshape(-1, n_kv_heads, head_dim).contiguous(),
-                        delta_position_ids,
-                        delta_seq_ids,
-                        get_page_ids=accessor.get_page_ids,
-                        get_offs_in_page=accessor.get_offs_in_page,
-                        use_i64_offsets=accessor.use_i64_offsets,
-                    )
-                    # 写入 V
-                    append_to_paged_kv_cache(
-                        accessor.v,
-                        accessor.block_table,
-                        finished_v.reshape(-1, n_kv_heads, head_dim).contiguous(),
-                        delta_position_ids,
-                        delta_seq_ids,
-                        get_page_ids=accessor.get_page_ids,
-                        get_offs_in_page=accessor.get_offs_in_page,
-                        use_i64_offsets=accessor.use_i64_offsets,
-                    )
+            Backend.model.attn_backend.write_finished_kv_cache(
+                block_finished_list, batch_size, output.past_key_values
+            )
 
         torch.cuda.synchronize()
 
