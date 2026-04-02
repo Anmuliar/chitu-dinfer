@@ -1509,12 +1509,11 @@ class Executor:
             + torch.arange(block_length, device=self.device).unsqueeze(0),
         ]
         block_finished = (decoded_block == mask_id).sum(dim=1) == 0
-        block_finished_list = block_finished.cpu().tolist()
 
         # 8) Write back KV to cache for block_finished
         if block_finished.any():
             Backend.model.attn_backend.write_finished_kv_cache(
-                block_finished_list, batch_size
+                block_finished, batch_size
             )
 
         torch.cuda.synchronize()
@@ -1523,7 +1522,7 @@ class Executor:
         for mgr in Backend.cache_managers.values():
             if hasattr(mgr, "finalize_cache_single_decode_dllm"):
                 mgr.finalize_cache_single_decode_dllm(
-                    tasks.req_ids, block_finished_list, block_length
+                    tasks.req_ids, block_finished, block_length
                 )
 
         # 10) Update task state (main rank only): next_block, decoding_start; for block_finished
@@ -1539,6 +1538,7 @@ class Executor:
             # Vectorized EOS check
             has_eos = (decoded_blocks == eos_id).any(dim=1)  # [batch_size]
             has_eos_list = has_eos.cpu().tolist()
+            block_finished_list = block_finished.cpu().tolist()  # Convert once for Python loop
 
             block_finished_tasks = []
             block_tokens_tensors = []

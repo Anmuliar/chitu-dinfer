@@ -955,7 +955,7 @@ class DLLMAttnBackend(FlashAttnBackend):
 
     def write_finished_kv_cache(
         self,
-        block_finished_list: list[bool],
+        block_finished: torch.Tensor,
         batch_size: int,
     ):
         """
@@ -965,14 +965,14 @@ class DLLMAttnBackend(FlashAttnBackend):
         Only writes KV for sequences where block_finished is True.
 
         Args:
-            block_finished_list: List of booleans indicating which sequences finished their block
+            block_finished: Boolean tensor [batch_size] indicating which sequences finished their block
             batch_size: Batch size
         """
-        if not any(block_finished_list) or self._decode_kv_cache is None:
+        if not block_finished.any() or self._decode_kv_cache is None:
             return
 
-        # 只写入 block_finished 的 batch
-        finished_indices = [i for i, f in enumerate(block_finished_list) if f]
+        # 获取已完成 batch 的索引
+        finished_indices = block_finished.nonzero(as_tuple=True)[0].tolist()
         if not finished_indices:
             return
 

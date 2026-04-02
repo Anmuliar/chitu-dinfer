@@ -417,12 +417,19 @@ class KVCacheManagerBase:
         self.curr_req_ids = req_ids
 
     def finalize_cache_single_decode_dllm(
-        self, req_ids: list[str], block_finished: list[bool], block_length: int
+        self, req_ids: list[str], block_finished: torch.Tensor, block_length: int
     ):
-        """Finalize DLLM decode: update req_id_to_seq_len for finished blocks."""
-        for req_id, finished in zip(req_ids, block_finished):
-            if finished:
-                self.req_id_to_seq_len[req_id] += block_length
+        """Finalize DLLM decode: update req_id_to_seq_len for finished blocks.
+
+        Args:
+            req_ids: List of request IDs
+            block_finished: Boolean tensor [batch_size] indicating finished blocks
+            block_length: Length of each block
+        """
+        # Get finished indices using torch.nonzero
+        finished_indices = block_finished.nonzero(as_tuple=True)[0].tolist()
+        for idx in finished_indices:
+            self.req_id_to_seq_len[req_ids[idx]] += block_length
         self.curr_req_ids = None
 
     def finalize_cache_all_decode(self, req_id: str):
