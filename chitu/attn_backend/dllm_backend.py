@@ -864,7 +864,8 @@ class DLLMAttnBackend(FlashAttnBackend):
         current_cache_length = max(128, align_exp2(current_cache_length))
 
         # Read past KV from paged cache if available
-        if isinstance(kv_cache, PagedKVCacheAccessor) and decoding_start_list[0] > 0:
+        # Check if ANY batch has historical KV to read (not just batch 0)
+        if isinstance(kv_cache, PagedKVCacheAccessor) and any(ds > 0 for ds in decoding_start_list):
             # Build position and sequence IDs for reading past KV
             pos_list = []
             seq_list = []
@@ -982,10 +983,10 @@ class DLLMAttnBackend(FlashAttnBackend):
         # 预构建 position_ids 和 seq_ids（所有层共用）
         delta_pos_list = []
         delta_seq_list = []
-        for new_idx, orig_idx in enumerate(finished_indices):
+        for orig_idx in finished_indices:
             ds = self._decoding_start_list[orig_idx]
             delta_pos_list.extend(range(ds, ds + self._block_length))
-            delta_seq_list.extend([new_idx] * self._block_length)
+            delta_seq_list.extend([orig_idx] * self._block_length)  # Use orig_idx to index into full batch block_table
 
         delta_position_ids = torch.tensor(delta_pos_list, device=device, dtype=torch.long)
         delta_seq_ids = torch.tensor(delta_seq_list, device=device, dtype=torch.long)
