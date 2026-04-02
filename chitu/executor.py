@@ -1374,35 +1374,23 @@ class Executor:
             .repeat(batch_size, 1, 1)
         )
 
-        # Model forward - prepare_prefill is called internally, KV cache handled by DLLMAttnBackend
-        output = Backend.model(
-            token_array[:, :max_prefilling_length].clone(memory_format=torch.contiguous_format),
-            use_cache=True,
-            attention_mask=bd_attn_mask[:, :max_prefilling_length, :max_prefilling_length].clone(
-                memory_format=torch.contiguous_format
-            ),
-            position_ids=torch.arange(max_prefilling_length, device=self.device)
-            .unsqueeze(0)
-            .repeat(batch_size, 1)
-            .clone(memory_format=torch.contiguous_format),
-            prefilling_lengths=prefilling_lengths,
+        # Model forward using new prefill_dllm method
+        output_token_offsets = torch.tensor(
+            [p - 1 for p in prefilling_lengths], device=self.device, dtype=torch.long
         )
 
-        # KV cache is now handled internally by DLLMAttnBackend
-        # No need to manually extract and write past_key_values
+        logits = Backend.model.prefill_dllm(
+            token_array[:, :max_prefilling_length].flatten(),
+            output_token_offsets,
+            attention_mask=bd_attn_mask[:, :max_prefilling_length, :max_prefilling_length],
+            prefilling_lengths=prefilling_lengths,
+        )
 
         for mgr in Backend.cache_managers.values():
             mgr.finalize_cache_all_prefill()
         torch.cuda.synchronize()
 
-        logits = output.logits
-        batch_size_ret = tasks.num_tasks
-        last_positions = torch.tensor(
-            [p - 1 for p in prefilling_lengths], device=logits.device, dtype=torch.long
-        )
-        return logits[
-            torch.arange(batch_size_ret, device=logits.device), last_positions, :
-        ]
+        return logits
 
     def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         """DLLM decode: payload is the full block per task (from next_block), not single token.
@@ -1487,22 +1475,12 @@ class Executor:
             decoding_start_list, device=self.device, dtype=torch.long
         )
 
-        decoding_pos_ids = (
-            torch.arange(block_length, device=self.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            + decoding_start_t.unsqueeze(1)
-        )
-
-        # 5) Model forward - prepare_decode is called internally, KV cache handled by DLLMAttnBackend
-        output = Backend.model(
-            decoding_block,
-            use_cache=True,
-            position_ids=decoding_pos_ids,
+        # 5) Model forward using new decode_dllm method
+        logits = Backend.model.decode_dllm(
+            decoding_block.flatten(),
             decoding_start_list=decoding_start_list,
+            block_length=block_length,
         )
-
-        logits = output.logits
         # CUDA Graph replay 会把 batch  pad 到 supported_batch_sizes（如 3→4、5→8），
         # logits 第一维为 padded_bs，而 x_data 为真实 batch_size；不截断会导致
         # batch_decode / torch.compile 里 mask_index 与 argmax(logits) 维数不一致（s31 vs s38）。

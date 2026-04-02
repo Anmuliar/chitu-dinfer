@@ -39,6 +39,7 @@ from chitu.attn_backend import AttnBackend, DLLMAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.cache_manager import KVCacheManagerBase, DenseKVCacheAccessor
 from chitu.dllm.decoder import DLLMDecoder
+from chitu.task_type import TaskType
 from chitu.models.model import MoeGate, ParallelMoeBlock, RMSNorm, TransformerBlock, get_linear_layout_contig_y
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
@@ -530,10 +531,17 @@ class TransformerBlockLLaDA2(TransformerBlock):
 
     @override
     def forward(
-        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        attention_mask: Optional[torch.Tensor] = None,
+        is_mtp: bool = False,
     ):
         x = x + self.attention(
-            self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis, is_mtp
+            self.input_layernorm(x, compute_dtype=x.dtype),
+            freqs_cis,
+            attention_mask,
+            is_mtp,
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
@@ -718,94 +726,128 @@ class TransformerLLaDA2(TransformerHFLlama):
         """Get the dLLM decoder instance."""
         return self.decoder
 
-    def forward(
+    @torch.inference_mode()
+    def prefill_dllm(
         self,
-        input_ids: torch.Tensor,
-        use_cache: bool = True,
-        position_ids: Optional[torch.Tensor] = None,
+        tokens: torch.Tensor,
+        output_token_offsets: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        decoding_start_list: Optional[list[int]] = None,
-        prefilling_lengths: Optional[list[int]] = None,
-    ) -> DLLMModelOutput:
-        """Forward pass for dLLM prefill/decode step.
+        prefilling_lengths: list[int] = None,
+    ) -> torch.Tensor:
+        """dLLM prefill with bidirectional attention.
+
+        Reuses parent class methods (_pre_layers, _post_layers, prepare_freqs_cis)
+        while supporting dLLM-specific bidirectional attention.
 
         Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-            use_cache: Whether to use KV cache (handled internally by attn_backend)
-            position_ids: Position IDs for RoPE [batch_size, seq_len]
+            tokens: Flattened token IDs [total_tokens]
+            output_token_offsets: Offsets to extract output tokens [batch_size]
             attention_mask: Attention mask for block-diagonal attention [batch, seq, seq]
-            decoding_start_list: List of starting positions for each sequence (for decode phase)
-            prefilling_lengths: List of prefilling lengths for each sequence (for prefill phase)
-        """
-        batch_size, block_length = input_ids.shape
-        device = input_ids.device
+            prefilling_lengths: List of prefilling lengths for each sequence
 
-        # Prepare attn_backend based on phase
-        num_layers = len(self.layers)
+        Returns:
+            Logits for output tokens [batch_size, vocab_size]
+        """
+        batch_size = len(prefilling_lengths)
+
+        # Prepare attn_backend
+        self.attn_backend.prepare_prefill(
+            cache_managers=self.cache_managers,
+            num_layers=len(self.layers),
+            prefilling_lengths=prefilling_lengths,
+            batch_size=batch_size,
+            attention_mask=attention_mask,
+        )
+
+        # Set seq_len_delta for prepare_freqs_cis
+        for mgr in self.cache_managers.values():
+            mgr.seq_len_delta.copy_from_list(
+                [0] * batch_size,  # old_lens
+                prefilling_lengths,  # new_lens
+            )
+
+        freqs_cis = self.prepare_freqs_cis()
+
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+
+        h = self._pre_layers(tokens)
+
+        for layer in self.layers:
+            h = layer(h, freqs_cis, attention_mask=attention_mask)
+
+        h = h[output_token_offsets]
+        h = self._post_layers(h)
+        h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def decode_dllm(
+        self,
+        tokens: torch.Tensor,
+        decoding_start_list: list[int],
+        block_length: int,
+    ) -> torch.Tensor:
+        """dLLM decode with bidirectional attention.
+
+        Reuses parent class methods for dLLM decode phase.
+
+        Args:
+            tokens: Flattened token IDs [batch_size * block_length]
+            decoding_start_list: List of starting positions for each sequence
+            block_length: Length of decode block
+
+        Returns:
+            Logits [batch_size, block_length, vocab_size]
+        """
+        batch_size = len(decoding_start_list)
+
+        # Get layer parameters
         first_layer = self.layers[0]
         kv_heads = first_layer.attention.n_local_kv_heads
         head_dim = first_layer.attention.head_dim
         dtype = first_layer.attention.query_layernorm.weight.dtype
 
-        if prefilling_lengths is not None:
-            # Prefill phase
-            self.attn_backend.prepare_prefill(
-                cache_managers=self.cache_managers,
-                num_layers=num_layers,
-                prefilling_lengths=prefilling_lengths,
-                batch_size=batch_size,
-                attention_mask=attention_mask,
-            )
-        elif decoding_start_list is not None:
-            # Decode phase
-            self.attn_backend.prepare_decode(
-                cache_managers=self.cache_managers,
-                num_layers=num_layers,
-                decoding_start_list=decoding_start_list,
-                block_length=block_length,
-                batch_size=batch_size,
-                kv_heads=kv_heads,
-                head_dim=head_dim,
-                device=device,
-                dtype=dtype,
+        # Prepare attn_backend
+        self.attn_backend.prepare_decode(
+            cache_managers=self.cache_managers,
+            num_layers=len(self.layers),
+            decoding_start_list=decoding_start_list,
+            block_length=block_length,
+            batch_size=batch_size,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            device=tokens.device,
+            dtype=dtype,
+        )
+
+        # Set seq_len_delta for prepare_freqs_cis
+        new_lens = [ds + block_length for ds in decoding_start_list]
+        for mgr in self.cache_managers.values():
+            mgr.seq_len_delta.copy_from_list(
+                decoding_start_list,  # old_lens
+                new_lens,  # new_lens
             )
 
-        # Get freqs_cis for RoPE
-        # position_ids: [batch_size, block_length] - each batch element has its own positions
-        # We need to flatten to [batch_size * block_length] for indexing the cos/sin cache
-        if position_ids is not None:
-            # Flatten position_ids to get position for each token
-            pos_ids_flat = position_ids.reshape(-1)  # [batch_size * block_length]
-        else:
-            # Default: sequential positions starting from 0
-            pos_ids_flat = torch.arange(batch_size * block_length, device=device)
+        freqs_cis = self.prepare_freqs_cis()
 
-        # Index into the RoPE cache - each token gets its correct position embedding
-        cos_single = self.rotary_emb.cos_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]
-        sin_single = self.rotary_emb.sin_cached[pos_ids_flat]  # [batch_size * block_length, head_dim]
-        freqs_cis = BatchedFreqsCis(cos_single, sin_single)
+        h = self._pre_layers(tokens)
 
-        # Embedding
-        h = self.embed_tokens(input_ids)
-        h = h.view(batch_size * block_length, -1)
-
-        # Process through transformer layers
         for layer in self.layers:
-            # Use standard attention interface
-            # KV cache handling is done internally by DLLMAttnBackend
-            normed = layer.input_layernorm(h, impl=get_rms_norm_impl())
-            attn_output = layer.attention(normed, freqs_cis, attention_mask=attention_mask)
-            h = h + attn_output
+            h = layer(h, freqs_cis)
 
-            # FFN/MoE
-            h = h + layer.mlp(layer.post_attention_layernorm(h, impl=get_rms_norm_impl()))
+        h = self._post_layers(h)
+        h = h.float()
+        return h.view(batch_size, block_length, -1)  # [batch, block_len, vocab]
 
-        # Output projection
-        h = h.view(batch_size * block_length, -1)
-        logits = self.lm_head(self.norm(h, impl=get_rms_norm_impl()))
-        # Reshape to [batch_size, block_length, vocab_size] for 3D indexing in executor
-        logits = logits.view(batch_size, block_length, -1)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        **kwargs,
+    ):
+        """Deprecated. Use prefill_dllm() or decode_dllm() instead."""
+        raise NotImplementedError(
+            "Use prefill_dllm() or decode_dllm() instead. "
+            "This method is deprecated for TransformerLLaDA2."
+        )
 
-        # KV cache is now stored in attn_backend._decode_kv_cache (pre-allocated tensor)
-        # and will be written to paged cache by write_finished_kv_cache in executor
-        return DLLMModelOutput(logits=logits, past_key_values=None)
