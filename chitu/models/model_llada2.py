@@ -802,11 +802,23 @@ class TransformerLLaDA2(TransformerHFLlama):
         """
         batch_size = len(decoding_start_list)
 
-        # Get layer parameters
-        first_layer = self.layers[0]
-        kv_heads = first_layer.attention.n_local_kv_heads
-        head_dim = first_layer.attention.head_dim
-        dtype = first_layer.attention.query_layernorm.weight.dtype
+        # Get layer parameters from params
+        head_dim = (
+            self.params.head_dim
+            if hasattr(self.params, "head_dim")
+            else self.params.dim // self.params.n_heads
+        )
+        n_kv_heads = (
+            self.params.n_heads
+            if self.params.n_kv_heads is None
+            else self.params.n_kv_heads
+        )
+        n_local_kv_heads = (
+            n_kv_heads // get_tp_size()
+            if n_kv_heads >= get_tp_size()
+            else 1
+        )
+        dtype = self.embed_tokens.weight.dtype
 
         # Prepare attn_backend
         self.attn_backend.prepare_decode(
@@ -815,7 +827,7 @@ class TransformerLLaDA2(TransformerHFLlama):
             decoding_start_list=decoding_start_list,
             block_length=block_length,
             batch_size=batch_size,
-            kv_heads=kv_heads,
+            kv_heads=n_local_kv_heads,
             head_dim=head_dim,
             device=tokens.device,
             dtype=dtype,
