@@ -1703,15 +1703,16 @@ class Executor:
         # Step 1: stream every token in the block to the request stream,
         #         notify_server=False so we batch the wake-up below.
         #         Skip prompt tokens (only output newly generated tokens).
-        for pos in range(block_length):
-            next_tokens = [int(result[i, pos].item()) for i in range(len(tasks_list))]
-            for i, task in enumerate(tasks_list):
-                # 跳过 prompt tokens
-                if pos < skip_prompt_tokens[i]:
-                    continue
-                task.update_response_sync(next_tokens[i])
+        for i, task in enumerate(tasks_list):
+            skip = skip_prompt_tokens[i]
+            if skip >= block_length:
+                continue  # 整个 block 都是 prompt，跳过
+            # 一次性取出该 task 需要的 tokens
+            tokens_to_output = result[i, skip:].tolist()
+            for token in tokens_to_output:
+                task.update_response_sync(token)
                 if task.req is not None:
-                    task.req.add_data(next_tokens[i], notify_server=False)
+                    task.req.add_data(token, notify_server=False)
 
         # Step 2: now that ALL tokens have been added, finish stopped tasks
         #         (finish() sends the stop signal + notifies the server).
