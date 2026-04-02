@@ -1542,12 +1542,22 @@ class Executor:
 
             block_finished_tasks = []
             block_tokens_tensors = []
+            block_skip_prompt_tokens = []  # 每个 task 需要跳过的 prompt tokens 数量
 
             for i, task in enumerate(tasks.tasks):
                 block_slice = decoded_blocks[i]
                 task.next_block = block_slice.cpu().tolist()
 
                 if block_finished_list[i]:
+                    # 计算当前 block 中有多少 prompt tokens 需要跳过
+                    # decoding_start 是 block 开始位置（更新前的值）
+                    # prompt_len 是原始 prompt 的长度（不变）
+                    # block 范围: [decoding_start, decoding_start + block_length)
+                    # prompt 范围: [0, prompt_len)
+                    # 需要跳过: [decoding_start, min(prompt_len, decoding_start + block_length))
+                    skip = max(0, min(task.prompt_len, decoding_start_list[i] + block_length) - decoding_start_list[i])
+                    block_skip_prompt_tokens.append(skip)
+
                     task.decoding_start += block_length
                     block_finished_tasks.append(task)
                     block_tokens_tensors.append(block_slice.clone())
@@ -1569,6 +1579,7 @@ class Executor:
             if block_finished_tasks:
                 block_tasks = PackedTasks([], tasks=block_finished_tasks)
                 block_tasks.generated_result = torch.stack(block_tokens_tensors)
+                block_tasks.skip_prompt_tokens = block_skip_prompt_tokens  # 每个 task 需要跳过的 prompt tokens 数量
                 self._pending_dllm_block = block_tasks
             else:
                 self._pending_dllm_block = None
@@ -1687,12 +1698,17 @@ class Executor:
         result = result.cpu()
         block_length = result.shape[1]
         tasks_list = block_tasks.tasks
+        skip_prompt_tokens = getattr(block_tasks, "skip_prompt_tokens", [0] * len(tasks_list))
 
         # Step 1: stream every token in the block to the request stream,
         #         notify_server=False so we batch the wake-up below.
+        #         Skip prompt tokens (only output newly generated tokens).
         for pos in range(block_length):
             next_tokens = [int(result[i, pos].item()) for i in range(len(tasks_list))]
             for i, task in enumerate(tasks_list):
+                # 跳过 prompt tokens
+                if pos < skip_prompt_tokens[i]:
+                    continue
                 task.update_response_sync(next_tokens[i])
                 if task.req is not None:
                     task.req.add_data(next_tokens[i], notify_server=False)
