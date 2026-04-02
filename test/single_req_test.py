@@ -7,6 +7,7 @@ import logging
 from logging import getLogger
 from pathlib import Path
 
+from chitu.models.registry import ModelType
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
     chitu_init,
@@ -234,7 +235,7 @@ def run_normal(args, timers):
             and not args.infer.language_model_only,
         )
         for req in reqs:
-            TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
+            TaskPool.add(Task(req.request_id, req, stop_with_eos=True, infermode="diffusionllm" if args.models.type == ModelType.LLADA2 else "autoregressive"))
         logger.info(f"------ batch {i} ------")
         t_start = time.time()
         timers("overall").start()

@@ -85,7 +85,7 @@ def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
 def infermode_for_current_model() -> str:
     """LLADA / diffusion LLM 使用 diffusionllm，其余为自回归。"""
     args = get_global_args()
-    return "diffusionllm" if (args.models.type == ModelType.LLADA or args.models.type == ModelType.LLADA2) else "autoregressive"
+    return "diffusionllm" if (args.models.type == ModelType.LLADA2) else "autoregressive"
 
 
 def submit_request(req: UserRequest) -> AsyncResponse:

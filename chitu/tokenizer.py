@@ -539,5 +539,4 @@ class ChatFormatLLaDA(ChatFormatHF):
 
         parts.append("<role>ASSISTANT</role>")
         prompt = "".join(parts)
-        logger.info(f"prompt: {prompt}")
         return self.tokenizer.encode(prompt, bos=False, eos=False)

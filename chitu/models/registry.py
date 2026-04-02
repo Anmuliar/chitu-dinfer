@@ -20,7 +20,6 @@ class ModelType(str, Enum):
     HF_MIXTRAL = "hf-mixtral"
     LLAMA = "llama"
     HF_QWEN3_NEXT = "hf-qwen3-next"
-    LLADA = "llada"
     LLADA2 = "llada2"
     HF_QWEN3_5 = "hf-qwen3-5"
 

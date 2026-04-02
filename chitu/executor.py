@@ -1307,7 +1307,7 @@ class Executor:
 
         is_empty_step = tasks.num_tasks == 0
 
-        block_length = 32
+        block_length = get_global_args().infer.dllm_block_length
         prefilling_lengths: list[int] = []
         if not is_empty_step:
             for it, task_id in enumerate(tasks.task_ids):
@@ -1410,13 +1410,11 @@ class Executor:
             return self.dummy_output
 
         decoder = Backend.model.decoder
-        block_length = 32
+        block_length = get_global_args().infer.dllm_block_length
         mask_id = decoder.mask_id
         eos_id = decoder.eos_id
 
         batch_size = tasks.num_tasks
-        prof_tp_bcast_decoding_ms = 0.0
-        prof_tp_payload_chain_ms = 0.0
 
         # 1) Get decoding_start_list: main rank from tasks, worker ranks via broadcast
         if self.tp_size > 1:
@@ -1487,28 +1485,25 @@ class Executor:
         if logits.shape[0] != batch_size:
             logits = logits[:batch_size, ...]
 
-        # 6) batch_decode: update block in token array (broadcast_if_needed syncs from rank 0)
+        # 6) batch_decode: update block tokens (broadcast_if_needed syncs from rank 0)
         total_len = max(decoding_start_list) + block_length
-        x_data = torch.full(
+        tokens = torch.full(
             (batch_size, total_len), mask_id, dtype=torch.long, device=self.device
         )
-        for i in range(batch_size):
-            x_data[i, decoding_start_list[i] : decoding_start_list[i] + block_length] = (
-                decoding_block[i]
-            )
+        # Scatter decoding_block into tokens at decoding_start positions
+        col_indices = (
+            torch.arange(block_length, device=self.device).unsqueeze(0)
+            + torch.tensor(decoding_start_list, device=self.device).unsqueeze(1)
+        )
+        tokens.scatter_(1, col_indices, decoding_block)
 
-        class TokenArrayLike:
-            def __init__(self, data):
-                self.data = data
-
-        x = TokenArrayLike(x_data)
         decoder.batch_decode(
-            logits, decoding_start_t, x, block_length
+            logits, decoding_start_t, tokens, block_length
         )
         torch.cuda.synchronize()
 
         # 7) block_finished: no mask left in block
-        decoded_block = x.data[
+        decoded_block = tokens[
             torch.arange(batch_size, device=self.device).unsqueeze(1),
             decoding_start_t.unsqueeze(1)
             + torch.arange(block_length, device=self.device).unsqueeze(0),
@@ -1534,17 +1529,42 @@ class Executor:
         # 10) Update task state (main rank only): next_block, decoding_start; for block_finished
         #     create PackedTasks with tokens+output. Worker ranks have PackedTasksBase, skip.
         if self.is_main_rank and isinstance(tasks, PackedTasks):
+            # Extract all decoded blocks at once using advanced indexing
+            col_indices = (
+                torch.arange(block_length, device=self.device).unsqueeze(0)
+                + torch.tensor(decoding_start_list, device=self.device).unsqueeze(1)
+            )
+            decoded_blocks = tokens.gather(1, col_indices)  # [batch_size, block_length]
+
+            # Vectorized EOS check
+            has_eos = (decoded_blocks == eos_id).any(dim=1)  # [batch_size]
+            has_eos_list = has_eos.cpu().tolist()
+
             block_finished_tasks = []
             block_tokens_tensors = []
+
             for i, task in enumerate(tasks.tasks):
-                block_slice = x.data[
-                    i, decoding_start_list[i] : decoding_start_list[i] + block_length
-                ]
+                block_slice = decoded_blocks[i]
                 task.next_block = block_slice.cpu().tolist()
+
                 if block_finished_list[i]:
                     task.decoding_start += block_length
                     block_finished_tasks.append(task)
                     block_tokens_tensors.append(block_slice.clone())
+
+                    # Check termination conditions
+                    if has_eos_list[i]:
+                        task.stopped = True
+                        if task.req is not None:
+                            task.req.finish_reason = "stop"
+                    elif (
+                        task.req is not None
+                        and task.req.num_output_tokens + block_length
+                        >= task.req.max_new_tokens
+                    ):
+                        task.stopped = True
+                        task.req.finish_reason = "length"
+                    task.next_block = None
 
             if block_finished_tasks:
                 block_tasks = PackedTasks([], tasks=block_finished_tasks)
@@ -1552,21 +1572,6 @@ class Executor:
                 self._pending_dllm_block = block_tasks
             else:
                 self._pending_dllm_block = None
-
-            for i, task in enumerate(tasks.tasks):
-                if block_finished_list[i]:
-                    if eos_id in task.next_block:
-                        task.stopped = True
-                        if task.req is not None:
-                            task.req.finish_reason = "stop"
-                    elif (
-                        task.req is not None
-                        and task.req.num_output_tokens + len(task.next_block)
-                        >= task.req.max_new_tokens
-                    ):
-                        task.stopped = True
-                        task.req.finish_reason = "length"
-                    task.next_block = None
         else:
             self._pending_dllm_block = None
 

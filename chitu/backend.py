@@ -769,47 +769,6 @@ class Backend:
                 raise NotImplementedError(
                     f"Unsupported mla_absorb {args.infer.mla_absorb}"
                 )
-        elif args.models.type == ModelType.LLADA:
-            # LLaDA: model uses checkpoint config; cache must match model output.
-            # Load from checkpoint so shape_per_token (n_kv_heads * head_dim) aligns.
-            try:
-                from transformers import AutoConfig
-
-                config_path = getattr(args.models, "model_config_path", None) or getattr(
-                    args.models, "ckpt_dir", None
-                )
-                if config_path:
-                    model_config = AutoConfig.from_pretrained(
-                        config_path, trust_remote_code=True
-                    )
-                    n_kv_heads = getattr(
-                        model_config, "num_key_value_heads", model_config.num_attention_heads
-                    )
-                    head_dim = getattr(model_config, "head_dim", None) or (
-                        model_config.hidden_size // model_config.num_attention_heads
-                    )
-                    logger.info(
-                        f"LLaDA cache: checkpoint config "
-                        f"num_key_value_heads={n_kv_heads}, head_dim={head_dim}"
-                    )
-                else:
-                    n_kv_heads = getattr(args.models, "n_kv_heads", args.models.n_heads)
-                    head_dim = getattr(args.models, "head_dim", None) or (
-                        args.models.dim // args.models.n_heads
-                    )
-            except Exception as e:
-                logger.warning(f"LLaDA: fallback to YAML config: {e}")
-                n_kv_heads = getattr(args.models, "n_kv_heads", args.models.n_heads)
-                head_dim = getattr(args.models, "head_dim", None) or (
-                    args.models.dim // args.models.n_heads
-                )
-            n_local_kv_heads = (
-                n_kv_heads // tensor_parallel_size
-                if n_kv_heads > tensor_parallel_size
-                else 1
-            )
-            kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
-            kv_cache_kvargs["head_dim"] = head_dim
         else:
             n_kv_heads = (
                 args.models.n_kv_heads
@@ -1033,15 +992,9 @@ class Backend:
         Backend.args = args
 
         if not args.debug.skip_model_load:
-            # LLaDA 使用 dinfer 的加载逻辑，需在默认设备上构建（与 dinfer benchmark 一致），
-            # 不能用 meta，否则 to_empty 会导致 expert_bias 等参数加载异常。
-            if args.models.type == ModelType.LLADA:
+            # Build the model. Don't allocate memory yet.
+            with torch.device("meta"):
                 model = Backend._build_model_architecture(args, attn_backend)
-            else:
-                # Build the model. Don't allocate memory yet.
-                with torch.device("meta"):
-                    model = Backend._build_model_architecture(args, attn_backend)
-
             # Load model parameters
             Backend._load_checkpoint(model, args)
 
@@ -1197,10 +1150,6 @@ class Backend:
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
             load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, args)
-        elif args.models.type == ModelType.LLADA:
-            model.load_weights(args.models.ckpt_dir, device="cuda")
-            logger.info(f"Checkpoint of llada loaded in {time.time() - start_time:.2f} seconds")
-            return 
         else:
             quant_config = getattr(args.models, "quant_config", None)
             quant_name = getattr(quant_config, "name", None)

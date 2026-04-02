@@ -238,7 +238,7 @@ def _warmup_via_taskpool(args):
         )
         warmup_seq_len = 1
         prefill_chunk_size = args.infer.max_seq_len * args.infer.max_reqs
-    infermode = "diffusionllm" if (args.models.type == ModelType.LLADA or args.models.type == ModelType.LLADA2) else "autoregressive"
+    infermode = "diffusionllm" if (args.models.type == ModelType.LLADA2) else "autoregressive"
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
