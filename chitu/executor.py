@@ -1363,18 +1363,11 @@ class Executor:
             return self.dummy_output
 
         batch_size = tasks.num_tasks
-        attn_mask_num_blocks = (max_prefilling_length + block_length - 1) // block_length
-        block_mask = torch.tril(
-            torch.ones(attn_mask_num_blocks, attn_mask_num_blocks, device="cuda", dtype=torch.bool)
-        )
-        bd_attn_mask = (
-            block_mask.repeat_interleave(block_length, dim=0)
-            .repeat_interleave(block_length, dim=1)
-            .unsqueeze(0)
-            .repeat(batch_size, 1, 1)
-        )
 
-        # Model forward using new prefill_dllm method
+        bd_attn_mask = torch.tril(
+            torch.ones(max_prefilling_length, max_prefilling_length, device="cuda", dtype=torch.bool)
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+
         output_token_offsets = torch.tensor(
             [p - 1 for p in prefilling_lengths], device=self.device, dtype=torch.long
         )
@@ -1706,8 +1699,7 @@ class Executor:
         for i, task in enumerate(tasks_list):
             skip = skip_prompt_tokens[i]
             if skip >= block_length:
-                continue  # 整个 block 都是 prompt，跳过
-            # 一次性取出该 task 需要的 tokens
+                continue
             tokens_to_output = result[i, skip:].tolist()
             for token in tokens_to_output:
                 task.update_response_sync(token)
