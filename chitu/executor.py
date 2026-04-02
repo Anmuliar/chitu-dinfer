@@ -57,6 +57,7 @@ from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     DisaggregationMode,
 )
+from chitu.dllm import TokenArray
 
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -912,16 +913,15 @@ class Executor:
 
     def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
         """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
+        block_length = get_global_args().infer.dllm_block_length
         blocks = []
         for task in tasks.tasks:
             if task.next_block is not None:
                 blocks.extend(task.next_block)
             else:
                 # Fallback: mask block if not set (e.g. from DP bootstrap)
-                from chitu.backend import Backend
-
                 mask_id = Backend.model.decoder.mask_id
-                blocks.extend([mask_id] * 32)
+                blocks.extend([mask_id] * block_length)
         return torch.tensor(blocks, device=self.device, dtype=torch.long)
 
     def _prepare_lhs_for_decode(self, tasks: PackedTasks):
@@ -1344,7 +1344,6 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
-        from chitu.dllm import TokenArray
         token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device, offset=[len(t) for t in tasks.tokens])
 
         # Only main rank (rank 0) updates task.decoding_start; worker ranks have PackedTasksBase

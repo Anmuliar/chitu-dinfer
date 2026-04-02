@@ -130,18 +130,13 @@ class DLLMAttnBackend(FlashAttnBackend):
         self._decoding_start_list = decoding_start_list
         self._block_length = block_length
         self._batch_size = batch_size
+        self._kv_heads = kv_heads
+        self._head_dim = head_dim
+        self._decode_kv_cache = torch.zeros(
+            num_layers, 2, batch_size * block_length, kv_heads, head_dim,
+            device=device, dtype=dtype
+        )
 
-        # 预分配 KV cache tensor
-        # shape: [num_layers, 2, batch * block_len, n_kv_heads, head_dim]
-        if kv_heads is not None and head_dim is not None and device is not None and dtype is not None:
-            self._kv_heads = kv_heads
-            self._head_dim = head_dim
-            self._decode_kv_cache = torch.zeros(
-                num_layers, 2, batch_size * block_length, kv_heads, head_dim,
-                device=device, dtype=dtype
-            )
-        else:
-            self._decode_kv_cache = None
 
     def bidirectional_prefill(
         self,

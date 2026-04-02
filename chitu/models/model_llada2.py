@@ -735,10 +735,6 @@ class TransformerLLaDA2(TransformerHFLlama):
         prefilling_lengths: list[int] = None,
     ) -> torch.Tensor:
         """dLLM prefill with bidirectional attention.
-
-        Reuses parent class methods (_pre_layers, _post_layers, prepare_freqs_cis)
-        while supporting dLLM-specific bidirectional attention.
-
         Args:
             tokens: Flattened token IDs [total_tokens]
             output_token_offsets: Offsets to extract output tokens [batch_size]
@@ -769,7 +765,7 @@ class TransformerLLaDA2(TransformerHFLlama):
         freqs_cis = self.prepare_freqs_cis()
 
         if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+            self.moe_impl.prepare(TaskType.PrefillDLLM, int(tokens.shape[0]))
 
         h = self._pre_layers(tokens)
 
