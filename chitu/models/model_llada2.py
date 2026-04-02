@@ -724,6 +724,7 @@ class TransformerLLaDA2(TransformerHFLlama):
         use_cache: bool = True,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        decoding_start_list: Optional[list[int]] = None,
     ) -> DLLMModelOutput:
         """Forward pass for dLLM prefill/decode step.
 
@@ -732,9 +733,30 @@ class TransformerLLaDA2(TransformerHFLlama):
             use_cache: Whether to use KV cache (handled internally by attn_backend)
             position_ids: Position IDs for RoPE [batch_size, seq_len]
             attention_mask: Attention mask for block-diagonal attention [batch, seq, seq]
+            decoding_start_list: List of starting positions for each sequence (for decode phase)
         """
         batch_size, block_length = input_ids.shape
         device = input_ids.device
+
+        # Prepare attn_backend for decode phase if decoding_start_list is provided
+        if decoding_start_list is not None:
+            num_layers = len(self.layers)
+            first_layer = self.layers[0]
+            kv_heads = first_layer.attention.n_local_kv_heads
+            head_dim = first_layer.attention.head_dim
+            dtype = torch.bfloat16
+
+            self.attn_backend.prepare_decode(
+                cache_managers=self.cache_managers,
+                num_layers=num_layers,
+                decoding_start_list=decoding_start_list,
+                block_length=block_length,
+                batch_size=batch_size,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                device=device,
+                dtype=dtype,
+            )
 
         # Get freqs_cis for RoPE
         # position_ids: [batch_size, block_length] - each batch element has its own positions
@@ -772,10 +794,6 @@ class TransformerLLaDA2(TransformerHFLlama):
         # Reshape to [batch_size, block_length, vocab_size] for 3D indexing in executor
         logits = logits.view(batch_size, block_length, -1)
 
-        # 收集 decode 阶段的 past_key_values（存储在 attn_backend 中）
-        past_key_values = None
-        if self.attn_backend._decode_kv_cache is not None:
-            past_key_values = self.attn_backend._decode_kv_cache
-            self.attn_backend._decode_kv_cache = None  # 重置
-
-        return DLLMModelOutput(logits=logits, past_key_values=past_key_values)
+        # KV cache is now stored in attn_backend._decode_kv_cache (pre-allocated tensor)
+        # and will be written to paged cache by write_finished_kv_cache in executor
+        return DLLMModelOutput(logits=logits, past_key_values=None)

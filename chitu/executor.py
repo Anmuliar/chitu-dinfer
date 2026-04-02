@@ -1491,18 +1491,7 @@ class Executor:
                 )
         PrometheusMetricsCollector.update_kvcache_usage()
 
-        # 4) Prepare attn_backend for decode phase
-        # KV cache reading is now handled internally by DLLMAttnBackend
-        num_layers = 20
-        Backend.model.attn_backend.prepare_decode(
-            cache_managers=Backend.cache_managers,
-            num_layers=num_layers,
-            decoding_start_list=decoding_start_list,
-            block_length=block_length,
-            batch_size=batch_size,
-        )
-
-        # 5) Reshape payload to [batch, block_length] and build position_ids
+        # 4) Reshape payload to [batch, block_length] and build position_ids
         decoding_block = payload.view(batch_size, block_length)
         decoding_start_t = torch.tensor(
             decoding_start_list, device=self.device, dtype=torch.long
@@ -1515,11 +1504,12 @@ class Executor:
             + decoding_start_t.unsqueeze(1)
         )
 
-        # 6) Model forward - KV cache is handled internally by DLLMAttnBackend
+        # 5) Model forward - prepare_decode is called internally, KV cache handled by DLLMAttnBackend
         output = Backend.model(
             decoding_block,
             use_cache=True,
             position_ids=decoding_pos_ids,
+            decoding_start_list=decoding_start_list,
         )
 
         logits = output.logits
@@ -1529,7 +1519,7 @@ class Executor:
         if logits.shape[0] != batch_size:
             logits = logits[:batch_size, ...]
 
-        # 7) batch_decode: update block in token array (broadcast_if_needed syncs from rank 0)
+        # 6) batch_decode: update block in token array (broadcast_if_needed syncs from rank 0)
         total_len = max(decoding_start_list) + block_length
         x_data = torch.full(
             (batch_size, total_len), mask_id, dtype=torch.long, device=self.device
@@ -1549,7 +1539,7 @@ class Executor:
         )
         torch.cuda.synchronize()
 
-        # 8) block_finished: no mask left in block
+        # 7) block_finished: no mask left in block
         decoded_block = x.data[
             torch.arange(batch_size, device=self.device).unsqueeze(1),
             decoding_start_t.unsqueeze(1)
@@ -1558,22 +1548,22 @@ class Executor:
         block_finished = (decoded_block == mask_id).sum(dim=1) == 0
         block_finished_list = block_finished.cpu().tolist()
 
-        # 9) Write back KV to cache for block_finished
-        if block_finished.any() and output.past_key_values is not None:
+        # 8) Write back KV to cache for block_finished
+        if block_finished.any():
             Backend.model.attn_backend.write_finished_kv_cache(
-                block_finished_list, batch_size, output.past_key_values
+                block_finished_list, batch_size
             )
 
         torch.cuda.synchronize()
 
-        # 10) Finalize cache: update req_id_to_seq_len for finished blocks
+        # 9) Finalize cache: update req_id_to_seq_len for finished blocks
         for mgr in Backend.cache_managers.values():
             if hasattr(mgr, "finalize_cache_single_decode_dllm"):
                 mgr.finalize_cache_single_decode_dllm(
                     tasks.req_ids, block_finished_list, block_length
                 )
 
-        # 11) Update task state (main rank only): next_block, decoding_start; for block_finished
+        # 10) Update task state (main rank only): next_block, decoding_start; for block_finished
         #     create PackedTasks with tokens+output. Worker ranks have PackedTasksBase, skip.
         if self.is_main_rank and isinstance(tasks, PackedTasks):
             block_finished_tasks = []

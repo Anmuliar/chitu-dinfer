@@ -49,7 +49,12 @@ class DLLMAttnBackend(FlashAttnBackend):
         self._decoding_start_list = None
         self._batch_size = None
         self._attention_mask = None  # For prefill phase
-        self._decode_kv_cache = None  # 存储 decode 阶段的 (k, v) 列表
+        # 存储 decode 阶段的 K、V tensor
+        # shape: [num_layers, 2, batch * block_len, n_kv_heads, head_dim]
+        # 其中 dim=1: 0 for K, 1 for V
+        self._decode_kv_cache = None
+        self._kv_heads = None
+        self._head_dim = None
 
     def prepare_for_dllm_decode(
         self,
@@ -101,6 +106,10 @@ class DLLMAttnBackend(FlashAttnBackend):
         decoding_start_list: list[int],
         block_length: int,
         batch_size: int,
+        kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         """Prepare for dLLM decode step.
 
@@ -110,6 +119,10 @@ class DLLMAttnBackend(FlashAttnBackend):
             decoding_start_list: List of starting positions for each sequence
             block_length: Block length being decoded
             batch_size: Batch size
+            kv_heads: Number of KV heads (for pre-allocating KV cache tensor)
+            head_dim: Head dimension (for pre-allocating KV cache tensor)
+            device: Device for KV cache tensor
+            dtype: Data type for KV cache tensor
         """
         self._is_prefill = False
         self._cache_managers = cache_managers
@@ -117,7 +130,18 @@ class DLLMAttnBackend(FlashAttnBackend):
         self._decoding_start_list = decoding_start_list
         self._block_length = block_length
         self._batch_size = batch_size
-        self._decode_kv_cache = None  # 重置 KV 缓存收集器
+
+        # 预分配 KV cache tensor
+        # shape: [num_layers, 2, batch * block_len, n_kv_heads, head_dim]
+        if kv_heads is not None and head_dim is not None and device is not None and dtype is not None:
+            self._kv_heads = kv_heads
+            self._head_dim = head_dim
+            self._decode_kv_cache = torch.zeros(
+                num_layers, 2, batch_size * block_length, kv_heads, head_dim,
+                device=device, dtype=dtype
+            )
+        else:
+            self._decode_kv_cache = None
 
     def bidirectional_prefill(
         self,
@@ -788,10 +812,12 @@ class DLLMAttnBackend(FlashAttnBackend):
         Returns:
             Attention output tensor [batch * block_len, nheads, headdim]
         """
-        # 存储当前层的 K、V（供后续在 executor 中写入 KV cache）
-        if self._decode_kv_cache is None:
-            self._decode_kv_cache = []
-        self._decode_kv_cache.append((k.detach().clone(), v.detach().clone()))
+        # 存储当前层的 K、V 到预分配的 tensor 中
+        if self._decode_kv_cache is not None:
+            # 直接写入预分配的 tensor，避免 detach().clone()
+            # shape: [num_layers, 2, batch * block_len, n_kv_heads, head_dim]
+            self._decode_kv_cache[layer_id, 0].copy_(k)
+            self._decode_kv_cache[layer_id, 1].copy_(v)
 
         # For dLLM decode, we use bidirectional attention over the full cache
         # The KV cache is already populated from prefill or previous decode steps
@@ -930,7 +956,6 @@ class DLLMAttnBackend(FlashAttnBackend):
         self,
         block_finished_list: list[bool],
         batch_size: int,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ):
         """
         Write KV cache for finished blocks to paged cache.
@@ -941,10 +966,8 @@ class DLLMAttnBackend(FlashAttnBackend):
         Args:
             block_finished_list: List of booleans indicating which sequences finished their block
             batch_size: Batch size
-            past_key_values: List of (K, V) tuples per layer. If None, uses self._decode_kv_cache.
         """
-        kv_cache = past_key_values if past_key_values is not None else self._decode_kv_cache
-        if not any(block_finished_list) or kv_cache is None:
+        if not any(block_finished_list) or self._decode_kv_cache is None:
             return
 
         # 只写入 block_finished 的 batch
@@ -952,33 +975,38 @@ class DLLMAttnBackend(FlashAttnBackend):
         if not finished_indices:
             return
 
-        device = kv_cache[0][0].device
+        device = self._decode_kv_cache.device
+        n_kv_heads = self._kv_heads
+        head_dim = self._head_dim
 
-        for layer_id, (layer_k, layer_v) in enumerate(kv_cache):
+        # 预构建 position_ids 和 seq_ids（所有层共用）
+        delta_pos_list = []
+        delta_seq_list = []
+        for new_idx, orig_idx in enumerate(finished_indices):
+            ds = self._decoding_start_list[orig_idx]
+            delta_pos_list.extend(range(ds, ds + self._block_length))
+            delta_seq_list.extend([new_idx] * self._block_length)
+
+        delta_position_ids = torch.tensor(delta_pos_list, device=device, dtype=torch.long)
+        delta_seq_ids = torch.tensor(delta_seq_list, device=device, dtype=torch.long)
+
+        # 遍历每一层
+        for layer_id in range(self._num_layers):
+            # 从预分配的 tensor 中获取 K、V
+            # shape: [batch * block_len, n_kv_heads, head_dim]
+            layer_k = self._decode_kv_cache[layer_id, 0]
+            layer_v = self._decode_kv_cache[layer_id, 1]
+
             for mgr in self._cache_managers.values():
                 try:
                     accessor = mgr.get_accessor(layer_id)
                 except KeyError:
                     continue
 
-                # layer_k, layer_v: [batch * block_len, n_kv_heads, head_dim]
-                n_kv_heads = layer_k.shape[1]
-                head_dim = layer_k.shape[2]
-
                 # 提取已完成 batch 的 K、V
+                # layer_k, layer_v: [batch * block_len, n_kv_heads, head_dim]
                 finished_k = layer_k.view(batch_size, self._block_length, n_kv_heads, head_dim)[finished_indices]
                 finished_v = layer_v.view(batch_size, self._block_length, n_kv_heads, head_dim)[finished_indices]
-
-                # 构建 position_ids 和 seq_ids
-                delta_pos_list = []
-                delta_seq_list = []
-                for new_idx, orig_idx in enumerate(finished_indices):
-                    ds = self._decoding_start_list[orig_idx]
-                    delta_pos_list.extend(range(ds, ds + self._block_length))
-                    delta_seq_list.extend([new_idx] * self._block_length)
-
-                delta_position_ids = torch.tensor(delta_pos_list, device=device, dtype=torch.long)
-                delta_seq_ids = torch.tensor(delta_seq_list, device=device, dtype=torch.long)
 
                 # 写入 K
                 append_to_paged_kv_cache(
