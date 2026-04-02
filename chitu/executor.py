@@ -1307,8 +1307,6 @@ class Executor:
 
         is_empty_step = tasks.num_tasks == 0
 
-        # Backend.model.model is ModelRunner; ModelRunner.model is the actual LLaDA model
-        num_layers = 20
         block_length = 32
         prefilling_lengths: list[int] = []
         if not is_empty_step:
@@ -1376,16 +1374,7 @@ class Executor:
             .repeat(batch_size, 1, 1)
         )
 
-        # Prepare attn_backend for prefill phase
-        # KV cache will be handled internally by DLLMAttnBackend
-        Backend.model.attn_backend.prepare_prefill(
-            cache_managers=Backend.cache_managers,
-            num_layers=num_layers,
-            prefilling_lengths=prefilling_lengths,
-            batch_size=batch_size,
-            attention_mask=bd_attn_mask[:, :max_prefilling_length, :max_prefilling_length],
-        )
-
+        # Model forward - prepare_prefill is called internally, KV cache handled by DLLMAttnBackend
         output = Backend.model(
             token_array[:, :max_prefilling_length].clone(memory_format=torch.contiguous_format),
             use_cache=True,
@@ -1396,6 +1385,7 @@ class Executor:
             .unsqueeze(0)
             .repeat(batch_size, 1)
             .clone(memory_format=torch.contiguous_format),
+            prefilling_lengths=prefilling_lengths,
         )
 
         # KV cache is now handled internally by DLLMAttnBackend

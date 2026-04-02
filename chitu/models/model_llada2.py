@@ -725,6 +725,7 @@ class TransformerLLaDA2(TransformerHFLlama):
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         decoding_start_list: Optional[list[int]] = None,
+        prefilling_lengths: Optional[list[int]] = None,
     ) -> DLLMModelOutput:
         """Forward pass for dLLM prefill/decode step.
 
@@ -734,18 +735,29 @@ class TransformerLLaDA2(TransformerHFLlama):
             position_ids: Position IDs for RoPE [batch_size, seq_len]
             attention_mask: Attention mask for block-diagonal attention [batch, seq, seq]
             decoding_start_list: List of starting positions for each sequence (for decode phase)
+            prefilling_lengths: List of prefilling lengths for each sequence (for prefill phase)
         """
         batch_size, block_length = input_ids.shape
         device = input_ids.device
 
-        # Prepare attn_backend for decode phase if decoding_start_list is provided
-        if decoding_start_list is not None:
-            num_layers = len(self.layers)
-            first_layer = self.layers[0]
-            kv_heads = first_layer.attention.n_local_kv_heads
-            head_dim = first_layer.attention.head_dim
-            dtype = torch.bfloat16
+        # Prepare attn_backend based on phase
+        num_layers = len(self.layers)
+        first_layer = self.layers[0]
+        kv_heads = first_layer.attention.n_local_kv_heads
+        head_dim = first_layer.attention.head_dim
+        dtype = first_layer.attention.query_layernorm.weight.dtype
 
+        if prefilling_lengths is not None:
+            # Prefill phase
+            self.attn_backend.prepare_prefill(
+                cache_managers=self.cache_managers,
+                num_layers=num_layers,
+                prefilling_lengths=prefilling_lengths,
+                batch_size=batch_size,
+                attention_mask=attention_mask,
+            )
+        elif decoding_start_list is not None:
+            # Decode phase
             self.attn_backend.prepare_decode(
                 cache_managers=self.cache_managers,
                 num_layers=num_layers,
