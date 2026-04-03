@@ -26,6 +26,7 @@ Checkpoint structure:
 """
 
 import functools
+from collections import OrderedDict
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Any, Callable, List, Mapping, Optional, Tuple
@@ -652,6 +653,35 @@ class TransformerLLaDA2(TransformerHFLlama):
             mappings.append(("model.norm.", "norm."))
             mappings.append(("lm_head.", "lm_head."))
         return mappings
+
+    @override
+    def process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
+        """Split query_key_value into q_proj, k_proj, v_proj for proper TP sharding."""
+        n_heads = self.params.n_heads
+        n_kv_heads = (
+            self.params.n_heads
+            if self.params.n_kv_heads is None
+            else self.params.n_kv_heads
+        )
+        return self.process_state_dict_for_splitting_tensors(
+            checkpoint,
+            "query_key_value",
+            tgt_layer_to_proportion=OrderedDict([
+                ("q_proj", n_heads),
+                ("k_proj", n_kv_heads),
+                ("v_proj", n_kv_heads)
+            ]),
+        )
+
+    @override
+    def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
+        """Merge q_proj, k_proj, v_proj back into query_key_value after TP sharding."""
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="query_key_value",
+            src_layers=["q_proj", "k_proj", "v_proj"],
+            enable_callback=QuantizationRegistry.allowed_merge_qkv,
+        )
 
     @override
     def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
