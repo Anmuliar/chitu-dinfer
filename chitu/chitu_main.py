@@ -294,7 +294,6 @@ def _warmup_via_taskpool(args):
         prefill_iter = 0
         while True:
             status = chitu_run()
-            logger.info(f"status: {status}")
             if status != SerializedPackedTasksPayloadType.NoneType:
                 prefill_iter += 1
             prefill_remaining = sum(

@@ -622,6 +622,7 @@ class TransformerLLaDA2(TransformerHFLlama):
             "gate_proj",
             "up_proj",
             "word_embeddings",
+            "embed_tokens",  # Mapped from word_embeddings in checkpoint
             "lm_head",
         ]
 
