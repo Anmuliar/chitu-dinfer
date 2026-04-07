@@ -1,8 +1,8 @@
-./script/srun_multi_node.sh 1 1 \
+./script/srun_multi_node.sh 1 2 \
     --master_port=22525 \
     test/single_req_test.py \
     serve.port=21111 \
-    infer.tp_size=1 \
+    infer.tp_size=2 \
     infer.cache_type=paged \
     models=LLaDA2.0-mini \
     models.ckpt_dir=/data/nfs/LLaDA2.1-mini \

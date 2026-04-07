@@ -722,10 +722,12 @@ class TransformerLLaDA2(TransformerHFLlama):
             )
 
         tokens_max_nelem = max_batch_size * block_length
-        vocab_size = self.params.vocab_size // get_tp_size()
+        # Note: lm_head uses ColumnParallelLinear with gather_output=True,
+        # so the output is the full vocab_size, not vocab_size/tp
+        vocab_size = self.params.vocab_size
 
         def output_max_nelem_callback(key, output):
-            # output: [batch * block_len, vocab_size/tp]
+            # output: [batch * block_len, vocab_size] (full vocab after gather)
             return max_batch_size * block_length * vocab_size
 
         @make_dispatched_graphed_callables(
