@@ -58,32 +58,10 @@ class DLLMAttnBackend(FlashAttnBackend):
         self._head_dim = None
 
         # CUDA Graph 静态张量
-        self._static_tensors = {}  # 静态张量存储
-        self._max_cache_length = 0  # 最大缓存长度
-        self._max_batch_size = 0  # 最大 batch size
-        self._use_cuda_graph = False  # 是否使用 CUDA Graph
-
-        # Debug: track first call with historical KV
-        self._debug_printed_historical_kv = False
-
-    def prepare_for_dllm_decode(
-        self,
-        cache_managers: dict[str, "KVCacheManagerBase"],
-        block_length: int,
-        cache_length: int,
-    ):
-        """Prepare for dLLM decode step.
-
-        This should be called before CUDA graph capture or replay.
-
-        Args:
-            cache_managers: KV cache managers dict
-            block_length: Current block length being decoded
-            cache_length: Total cache length (including current block)
-        """
-        self._cache_managers = cache_managers
-        self._block_length = block_length
-        self._cache_length = cache_length
+        self._static_tensors = {}
+        self._max_cache_length = 0
+        self._max_batch_size = 0
+        self._use_cuda_graph = False
 
     def prepare_prefill(
         self,
@@ -160,107 +138,56 @@ class DLLMAttnBackend(FlashAttnBackend):
         device: torch.device,
         dtype: torch.dtype,
     ):
-        """Initialize static tensors for CUDA Graph decode.
-
-        This should be called once before CUDA graph capture.
-
-        Args:
-            max_batch_size: Maximum batch size
-            max_cache_length: Maximum cache length (including current block)
-            kv_heads: Number of KV heads
-            head_dim: Head dimension
-            num_layers: Number of layers
-            device: Device for tensors
-            dtype: Data type for tensors
-        """
+        """Initialize static tensors for CUDA Graph decode."""
         self._max_batch_size = max_batch_size
         self._max_cache_length = max_cache_length
         self._use_cuda_graph = True
 
         # Align cache length to power of 2
-        def align_exp2(x):
-            return 1 << (x - 1).bit_length() if x > 0 else 1
-        aligned_cache_length = max(128, align_exp2(max_cache_length))
+        aligned_cache_length = max(128, 1 << max(0, (max_cache_length - 1)).bit_length())
 
-        # 静态张量: max_ds [1] - maximum decoding_start value
-        # 用于在 CUDA Graph 内部动态确定历史 KV 的长度
-        self._static_tensors["max_ds"] = StaticTensor(
-            torch.zeros(1, dtype=torch.long, device=device),
-            max_nelem=1,
-        )
-
-        # 静态张量: total_past [1] - total number of past tokens
-        self._static_tensors["total_past"] = StaticTensor(
-            torch.zeros(1, dtype=torch.long, device=device),
-            max_nelem=1,
-        )
-
-        # 静态张量: position_ids [max_total_past_tokens]
-        # 用于存储从 paged cache 读取历史 KV 时的 position ids
         max_total_past_tokens = max_batch_size * max_cache_length
+
+        # Static tensors for position/sequence tracking
+        self._static_tensors["max_ds"] = StaticTensor(
+            torch.zeros(1, dtype=torch.long, device=device), max_nelem=1)
+        self._static_tensors["total_past"] = StaticTensor(
+            torch.zeros(1, dtype=torch.long, device=device), max_nelem=1)
         self._static_tensors["position_ids"] = StaticTensor(
             torch.empty(max_total_past_tokens, dtype=torch.long, device=device),
-            max_nelem=max_total_past_tokens,
-        )
-
-        # 静态张量: seq_ids [max_total_past_tokens]
+            max_nelem=max_total_past_tokens)
         self._static_tensors["seq_ids"] = StaticTensor(
             torch.empty(max_total_past_tokens, dtype=torch.long, device=device),
-            max_nelem=max_total_past_tokens,
-        )
+            max_nelem=max_total_past_tokens)
 
-        # 静态张量: past_k_dense_per_layer [num_layers, batch, kv_heads, cache_len, head_dim]
-        # 每层独立的历史 KV cache，用于 CUDA Graph
+        # Per-layer KV cache tensors
+        kv_cache_shape = (num_layers, max_batch_size, kv_heads, aligned_cache_length, head_dim)
+        kv_cache_nelem = num_layers * max_batch_size * kv_heads * aligned_cache_length * head_dim
         self._static_tensors["past_k_dense_per_layer"] = StaticTensor(
-            torch.empty(num_layers, max_batch_size, kv_heads, aligned_cache_length, head_dim, dtype=dtype, device=device),
-            max_nelem=num_layers * max_batch_size * kv_heads * aligned_cache_length * head_dim,
-        )
-
+            torch.empty(*kv_cache_shape, dtype=dtype, device=device), max_nelem=kv_cache_nelem)
         self._static_tensors["past_v_dense_per_layer"] = StaticTensor(
-            torch.empty(num_layers, max_batch_size, kv_heads, aligned_cache_length, head_dim, dtype=dtype, device=device),
-            max_nelem=num_layers * max_batch_size * kv_heads * aligned_cache_length * head_dim,
-        )
-
-        # 静态张量: full_k_per_layer [num_layers, batch, kv_heads, cache_len, head_dim]
-        # 预合并的完整 KV（历史 + 当前），在 graph 外部准备
+            torch.empty(*kv_cache_shape, dtype=dtype, device=device), max_nelem=kv_cache_nelem)
         self._static_tensors["full_k_per_layer"] = StaticTensor(
-            torch.empty(num_layers, max_batch_size, kv_heads, aligned_cache_length, head_dim, dtype=dtype, device=device),
-            max_nelem=num_layers * max_batch_size * kv_heads * aligned_cache_length * head_dim,
-        )
-
+            torch.empty(*kv_cache_shape, dtype=dtype, device=device), max_nelem=kv_cache_nelem)
         self._static_tensors["full_v_per_layer"] = StaticTensor(
-            torch.empty(num_layers, max_batch_size, kv_heads, aligned_cache_length, head_dim, dtype=dtype, device=device),
-            max_nelem=num_layers * max_batch_size * kv_heads * aligned_cache_length * head_dim,
-        )
+            torch.empty(*kv_cache_shape, dtype=dtype, device=device), max_nelem=kv_cache_nelem)
 
-        # 静态张量: kv_valid_mask [batch, cache_len]
-        # Attention mask for valid KV positions
+        # Attention mask and write positions
         self._static_tensors["kv_valid_mask"] = StaticTensor(
             torch.zeros(max_batch_size, aligned_cache_length, dtype=torch.bool, device=device),
-            max_nelem=max_batch_size * aligned_cache_length,
-        )
-
-        # 静态张量: kv_write_positions [batch, block_len]
-        # Positions where current KV should be written
-        # Note: block_len is typically fixed, we use max_cache_length as upper bound
+            max_nelem=max_batch_size * aligned_cache_length)
         self._static_tensors["kv_write_positions"] = StaticTensor(
             torch.zeros(max_batch_size, aligned_cache_length, dtype=torch.long, device=device),
-            max_nelem=max_batch_size * aligned_cache_length,
-        )
+            max_nelem=max_batch_size * aligned_cache_length)
 
-        # Initialize _max_ds_for_graph to None
         self._max_ds_for_graph = None
 
-        # 静态张量: _decode_kv_cache [num_layers, 2, batch * block_len, kv_heads, head_dim]
-        # 用于存储当前 block 的 K/V，供 write_finished_kv_cache 使用
-        # 注意：这个 tensor 在 graph 外部使用，但必须在 graph capture 之前创建
-        # 这样 graph 内部的 .copy_() 操作才能正确执行
-        # 假设 block_length 最大为 max_cache_length（实际上要小得多）
-        max_block_length = 128  # 假设最大 block 长度
+        # Decode KV cache for current block (used by write_finished_kv_cache)
+        max_block_length = 128
         self._static_tensors["decode_kv_cache"] = StaticTensor(
-            torch.zeros(num_layers, 2, max_batch_size * max_block_length, kv_heads, head_dim, dtype=dtype, device=device),
-            max_nelem=num_layers * 2 * max_batch_size * max_block_length * kv_heads * head_dim,
-        )
+            torch.zeros(num_layers, 2, max_batch_size * max_block_length, kv_heads, head_dim,
+                        dtype=dtype, device=device),
+            max_nelem=num_layers * 2 * max_batch_size * max_block_length * kv_heads * head_dim)
         self._decode_kv_cache = self._static_tensors["decode_kv_cache"].get()
         self._max_block_length = max_block_length
 
@@ -269,141 +196,81 @@ class DLLMAttnBackend(FlashAttnBackend):
         decoding_start_list: list[int],
         batch_size: int,
     ):
-        """Update static tensor contents before CUDA Graph replay.
-
-        This should be called before each graph replay to:
-        1. Pre-read historical KV from paged cache into full_k_per_layer/full_v_per_layer
-        2. Prepare kv_valid_mask for attention
-        3. Prepare kv_write_positions for writing current KV in the graph
-
-        IMPORTANT: This method performs all dynamic operations OUTSIDE the CUDA Graph,
-        so that the graph only needs to use pre-prepared static tensors.
-
-        Args:
-            decoding_start_list: List of starting positions for each sequence
-            batch_size: Current batch size
-        """
-        # Update internal state used by _decode_attention_graph_safe
+        """Update static tensors before CUDA Graph replay."""
         self._decoding_start_list = decoding_start_list
         self._batch_size = batch_size
 
         if not self._static_tensors:
             return
 
-        # Calculate max_ds and total_past
         max_ds = max(decoding_start_list) if decoding_start_list else 0
-        total_past = sum(decoding_start_list)
         has_historical_kv = any(ds > 0 for ds in decoding_start_list)
 
-        # Store max_ds and write_start as Python attributes
-        # These are used in _decode_attention_graph_safe for fixed slicing
-        # The values are set BEFORE graph replay
         self._max_ds_for_graph = max_ds
-        self._graph_write_start = max_ds  # Current KV is written starting from max_ds
+        self._graph_write_start = max_ds
 
-        # Get full KV tensors
         full_k_per_layer = self._static_tensors["full_k_per_layer"].get()
         full_v_per_layer = self._static_tensors["full_v_per_layer"].get()
-
-        # Prepare kv_valid_mask: [batch, cache_len]
-        # True for valid KV positions, False for padding
         cache_len = full_k_per_layer.shape[3]
         block_length = self._block_length
-        kv_valid_mask = torch.zeros(batch_size, cache_len, dtype=torch.bool, device=full_k_per_layer.device)
+        device = full_k_per_layer.device
 
-        # Prepare kv_write_positions: [batch, block_len]
-        # Each element is the position where that token's KV should be written
-        kv_write_positions = torch.zeros(batch_size, block_length, dtype=torch.long, device=full_k_per_layer.device)
+        # Prepare kv_valid_mask and kv_write_positions
+        kv_valid_mask = torch.zeros(batch_size, cache_len, dtype=torch.bool, device=device)
+        kv_write_positions = torch.zeros(batch_size, block_length, dtype=torch.long, device=device)
 
-        # Track the previous max_ds to know if block finished
-        prev_max_ds = getattr(self, '_prev_max_ds', -1)
-
-        # Determine if we need to zero and re-read:
-        # 1. max_ds > prev_max_ds: block finished, need to read new history from paged cache
-        # 2. max_ds < prev_max_ds: new request started, need to zero everything
-        # 3. max_ds == prev_max_ds: block not finished, keep existing data
-        is_new_request = (max_ds < prev_max_ds) if prev_max_ds >= 0 else True
-        block_finished = (max_ds > prev_max_ds) if prev_max_ds >= 0 else True
-        need_refresh = is_new_request or block_finished
-
-        # Set valid positions and write positions for each batch item
         for batch_idx, ds in enumerate(decoding_start_list):
-            # Historical KV: positions [0, ds)
-            # Current KV: positions [ds, ds + block_length)
-            # Set valid positions for historical KV
-            kv_valid_mask[batch_idx, :ds] = True
-            # Set valid positions for current KV (will be written in the graph)
-            kv_valid_mask[batch_idx, ds:ds+block_length] = True
-            # Set write positions for current KV
-            kv_write_positions[batch_idx, :] = torch.arange(ds, ds+block_length, device=full_k_per_layer.device)
+            kv_valid_mask[batch_idx, :ds + block_length] = True
+            kv_write_positions[batch_idx, :] = torch.arange(ds, ds + block_length, device=device)
 
-        # Store tensors
         self._static_tensors["kv_valid_mask"].set(kv_valid_mask)
         self._static_tensors["kv_write_positions"].set(kv_write_positions)
 
-        # Update prev_max_ds for next call
+        # Track previous max_ds to determine if refresh needed
+        prev_max_ds = getattr(self, '_prev_max_ds', -1)
+        need_refresh = (max_ds != prev_max_ds)
         self._prev_max_ds = max_ds
 
-        # Only zero and re-read if needed
-        if not need_refresh:
+        if not need_refresh or not has_historical_kv:
+            if need_refresh:
+                full_k_per_layer.zero_()
+                full_v_per_layer.zero_()
             return
 
-        # Zero and re-read from paged cache
+        # Zero and read historical KV from paged cache
         full_k_per_layer.zero_()
         full_v_per_layer.zero_()
 
-        # Check if there's any historical KV to read from paged cache
-        if not has_historical_kv:
-            # No historical KV, nothing to read
+        pos_list, seq_list = [], []
+        for i, ds in enumerate(decoding_start_list):
+            pos_list.extend(range(ds))
+            seq_list.extend([i] * ds)
+
+        if not pos_list:
             return
 
-        # Build position and sequence IDs for reading past KV
-        pos_list = []
-        seq_list = []
-        for i, ds in enumerate(decoding_start_list):
-            for p in range(ds):
-                pos_list.append(p)
-                seq_list.append(i)
+        position_ids = torch.tensor(pos_list, dtype=torch.long, device=device)
+        seq_ids = torch.tensor(seq_list, dtype=torch.long, device=device)
 
-        if pos_list:
-            position_ids = torch.tensor(pos_list, dtype=torch.long,
-                                        device=full_k_per_layer.device)
-            seq_ids = torch.tensor(seq_list, dtype=torch.long,
-                                   device=full_k_per_layer.device)
+        for layer_id in range(self._num_layers):
+            for mgr in self._cache_managers.values():
+                try:
+                    kv_accessor = mgr.get_accessor(layer_id)
+                    break
+                except KeyError:
+                    continue
+            else:
+                continue
 
-            # Read historical KV from paged cache for each layer
-            # This is done OUTSIDE the graph, so dynamic operations are allowed
-            for layer_id in range(self._num_layers):
-                # Find the cache manager that has this layer
-                for mgr in self._cache_managers.values():
-                    try:
-                        kv_accessor = mgr.get_accessor(layer_id)
-                        break
-                    except KeyError:
-                        continue
-                else:
-                    continue  # No manager for this layer
+            past_k = read_from_paged_kv_cache(
+                kv_accessor.k, kv_accessor.block_table, position_ids, seq_ids)
+            past_v = read_from_paged_kv_cache(
+                kv_accessor.v, kv_accessor.block_table, position_ids, seq_ids)
 
-                # Read past K and V from paged cache
-                past_k = read_from_paged_kv_cache(
-                    kv_accessor.k,
-                    kv_accessor.block_table,
-                    position_ids,
-                    seq_ids,
-                )
-                past_v = read_from_paged_kv_cache(
-                    kv_accessor.v,
-                    kv_accessor.block_table,
-                    position_ids,
-                    seq_ids,
-                )
-
-                # past_k shape: [total_past_tokens, n_kv_heads, head_dim]
-                # full_k_per_layer shape: [num_layers, batch, kv_heads, cache_len, head_dim]
-                # Scatter ragged to dense at positions [:, :, :max_ds, :]
-                for idx_in_ragged, (seq_idx, pos_idx) in enumerate(zip(seq_list, pos_list)):
-                    full_k_per_layer[layer_id, seq_idx, :, pos_idx, :] = past_k[idx_in_ragged]
-                    full_v_per_layer[layer_id, seq_idx, :, pos_idx, :] = past_v[idx_in_ragged]
+            # Scatter ragged to dense
+            for idx, (seq_idx, pos_idx) in enumerate(zip(seq_list, pos_list)):
+                full_k_per_layer[layer_id, seq_idx, :, pos_idx, :] = past_k[idx]
+                full_v_per_layer[layer_id, seq_idx, :, pos_idx, :] = past_v[idx]
 
     def _decode_attention_graph_safe(
         self,
@@ -415,105 +282,54 @@ class DLLMAttnBackend(FlashAttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         layer_id: int,
     ) -> torch.Tensor:
-        """
-        CUDA Graph safe version of _decode_attention.
-
-        Key design:
-        1. Historical KV is pre-read into full_k_per_layer/full_v_per_layer
-           in update_static_tensors_for_decode() (before graph replay)
-        2. Current KV is merged with historical KV using pre-computed indices
-        3. Attention uses the pre-populated full KV with a mask for valid positions
-
-        IMPORTANT: The write position is stored in kv_write_positions tensor,
-        which is updated before each graph replay. We use scatter operations
-        to write current KV to the correct positions.
-
-        Args:
-            q: Query tensor [batch * block_len, nheads, headdim]
-            kv_cache: PagedKVCacheAccessor
-            k: Key tensor [batch * block_len, nheads_k, headdim]
-            v: Value tensor [batch * block_len, nheads_k, headdim]
-            seq_len_delta: Sequence length delta info
-            layer_id: Layer ID
-
-        Returns:
-            Attention output tensor [batch * block_len, nheads, headdim]
-        """
+        """CUDA Graph safe version of _decode_attention."""
         block_length = self._block_length or seq_len_delta.delta_max_len
         batch_size = self._batch_size or seq_len_delta.batch_size
-
         n_heads = q.shape[1]
         n_kv_heads = k.shape[1]
         head_dim = q.shape[2]
 
-        # 存储当前层的 K、V 到预分配的 tensor 中
-        # 使用切片确保只复制当前 batch_size * block_length 大小的数据
+        # Store current K/V for write_finished_kv_cache
         if self._decode_kv_cache is not None:
             kv_size = batch_size * block_length
             self._decode_kv_cache[layer_id, 0, :kv_size].copy_(k)
             self._decode_kv_cache[layer_id, 1, :kv_size].copy_(v)
 
-        # Get pre-populated full KV tensor for this layer
-        # Shape: [batch, kv_heads, cache_len, head_dim]
-        # Historical KV is already in [:, :, :max_ds, :]
+        # Get pre-populated full KV tensor
         full_k = self._static_tensors["full_k_per_layer"].get()[layer_id, :batch_size]
         full_v = self._static_tensors["full_v_per_layer"].get()[layer_id, :batch_size]
 
-        # Current K, V: reshape to [batch, kv_heads, block_len, head_dim]
+        # Reshape current K, V and scatter to correct positions
         k_t = k.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
         v_t = v.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
-
-        # Write current KV to the correct positions using scatter
-        # kv_write_positions shape: [batch, block_len]
-        # Each element is the position where that token's KV should be written
         kv_write_positions = self._static_tensors["kv_write_positions"].get()[:batch_size, :block_length]
 
-        # Use scatter to write current KV
-        # For each (batch, block_pos), write k_t[batch, :, block_pos, :] to full_k[batch, :, write_pos, :]
-        # We use scatter_ which is in-place and CUDA Graph safe
-
-        # Permute to put sequence dimension last for scatter
-        # full_k: [batch, kv_heads, cache_len, head_dim] -> [batch, kv_heads, head_dim, cache_len]
+        # Permute for scatter operation
         full_k_permuted = full_k.permute(0, 1, 3, 2)
         full_v_permuted = full_v.permute(0, 1, 3, 2)
-
-        # k_t: [batch, kv_heads, block_len, head_dim] -> [batch, kv_heads, head_dim, block_len]
         k_t_permuted = k_t.permute(0, 1, 3, 2)
         v_t_permuted = v_t.permute(0, 1, 3, 2)
-
-        # Prepare scatter indices
-        # kv_write_positions: [batch, block_len] -> [batch, 1, 1, block_len] for broadcast
         write_idx = kv_write_positions.unsqueeze(1).unsqueeze(2).expand(-1, n_kv_heads, head_dim, -1)
 
-        # Scatter along dimension 3 (the cache_len dimension after permute)
-        # This writes k_t_permuted[b, h, d, p] to full_k_permuted[b, h, d, write_idx[b, h, d, p]]
         full_k_permuted.scatter_(dim=3, index=write_idx, src=k_t_permuted)
         full_v_permuted.scatter_(dim=3, index=write_idx, src=v_t_permuted)
 
-        # Permute back to original shape
-        full_k = full_k_permuted.permute(0, 1, 3, 2)  # [batch, kv_heads, cache_len, head_dim]
+        full_k = full_k_permuted.permute(0, 1, 3, 2)
         full_v = full_v_permuted.permute(0, 1, 3, 2)
 
-        # Handle GQA: repeat KV if needed
+        # Handle GQA
         if n_heads != n_kv_heads:
             n_rep = n_heads // n_kv_heads
             full_k = full_k.repeat_interleave(n_rep, dim=1)
             full_v = full_v.repeat_interleave(n_rep, dim=1)
 
-        # Q reshape to [batch, heads, block_len, head_dim]
         q_4d = q.view(batch_size, block_length, n_heads, head_dim).transpose(1, 2)
-
-        # Get attention mask for valid KV positions
-        # Shape: [batch, cache_len], True for valid positions
         kv_valid_mask = self._static_tensors["kv_valid_mask"].get()[:batch_size, :]
 
-        # Convert to attention mask format for SDPA
-        # [batch, 1, 1, cache_len] - broadcast across heads and query positions
-        # Use the same dtype as q_4d for the mask
-        attn_mask = kv_valid_mask.unsqueeze(1).unsqueeze(2).to(q_4d.dtype)
-        attn_mask = attn_mask.masked_fill(kv_valid_mask.unsqueeze(1).unsqueeze(2) == 0, float('-inf')).masked_fill(kv_valid_mask.unsqueeze(1).unsqueeze(2) == 1, 0.0)
+        # Build attention mask
+        attn_mask = kv_valid_mask.unsqueeze(1).unsqueeze(2)
+        attn_mask = attn_mask.to(q_4d.dtype).masked_fill(~attn_mask, float('-inf'))
 
-        # Use SDPA with attention mask
         output = F.scaled_dot_product_attention(
             q_4d, full_k, full_v,
             attn_mask=attn_mask,
@@ -651,72 +467,6 @@ class DLLMAttnBackend(FlashAttnBackend):
         output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
         return output
 
-    def decode_with_kv_replace(
-        self,
-        q: torch.Tensor,  # [batch, heads, seq_q, head_dim]
-        kv_cache: DenseKVCacheAccessor,
-        k: torch.Tensor,  # [batch, heads, seq_k, head_dim]
-        v: torch.Tensor,  # [batch, heads, seq_k, head_dim]
-        *,
-        replace_start: int,
-        replace_end: int,
-        softmax_scale: Optional[float] = None,
-    ) -> torch.Tensor:
-        """
-        dLLM decode: Replace KV cache and execute bidirectional attention.
-
-        This is the core operation for dLLM iterative decoding:
-        1. Replace KV cache at specific positions using slice_scatter
-        2. Execute bidirectional attention over the full cache
-
-        Args:
-            q: Query tensor [batch, heads, seq_q, head_dim]
-            kv_cache: DenseKVCacheAccessor (will be modified in-place)
-            k, v: Key/Value tensors to write [batch, heads, seq_k, head_dim]
-            replace_start: Start position for KV replacement
-            replace_end: End position for KV replacement
-            softmax_scale: Scale factor for softmax (default: 1/sqrt(head_dim))
-
-        Returns:
-            Attention output tensor [batch, heads, seq_q, head_dim]
-        """
-        if softmax_scale is None:
-            softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
-
-        # 1. Replace KV cache at specified positions
-        # slice_scatter: scatter source tensor into destination at specified slice
-        kv_cache.kv["k"] = kv_cache.kv["k"].slice_scatter(
-            k, dim=2, start=replace_start, end=replace_end
-        )
-        kv_cache.kv["v"] = kv_cache.kv["v"].slice_scatter(
-            v, dim=2, start=replace_start, end=replace_end
-        )
-
-        # 2. Execute bidirectional attention using Flash Attention
-        # flash_attn_func expects [batch, seqlen, nheads, headdim]
-        # We receive [batch, heads, seq, head_dim], need to transpose
-        if has_flash_attn:
-            q_t = q.transpose(1, 2)  # [batch, seq_q, heads, head_dim]
-            k_t = kv_cache.k.transpose(1, 2)  # [batch, seq_k, heads, head_dim]
-            v_t = kv_cache.v.transpose(1, 2)  # [batch, seq_k, heads, head_dim]
-
-            output = flash_attn.flash_attn_func(
-                q_t, k_t, v_t,
-                causal=False,  # Bidirectional attention
-                softmax_scale=softmax_scale,
-            )
-            # Transpose back to [batch, heads, seq_q, head_dim]
-            return output.transpose(1, 2)
-        else:
-            # Fallback to SDPA if Flash Attention not available
-            return F.scaled_dot_product_attention(
-                q, kv_cache.k, kv_cache.v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=softmax_scale,
-            )
-
     def decode_bidirectional_simple(
         self,
         q: torch.Tensor,  # [batch, heads, seq_q, head_dim]
@@ -759,221 +509,6 @@ class DLLMAttnBackend(FlashAttnBackend):
                 dropout_p=0.0,
                 is_causal=False,
                 scale=softmax_scale,
-            )
-
-    def dllm_decode_attention(
-        self,
-        q: torch.Tensor,  # [batch, heads, seq_q, head_dim]
-        k: torch.Tensor,  # [batch, kv_heads, seq_k, head_dim]
-        v: torch.Tensor,  # [batch, kv_heads, seq_k, head_dim]
-        layer_id: int,
-        kv_accessor: DenseKVCacheAccessor,
-        *,
-        softmax_scale: Optional[float] = None,
-        cache_length: Optional[int] = None,
-        block_length: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        dLLM decode attention with KV cache update.
-
-        This method is designed to be CUDA graph compatible:
-        1. Uses in-place index assignment for KV cache update (graph-safe)
-        2. Executes bidirectional attention over full cache
-
-        IMPORTANT: This method updates KV cache in-place using index assignment.
-        The KV cache tensor addresses must remain fixed across graph replays.
-
-        Args:
-            q: Query tensor [batch, heads, seq_q, head_dim]
-            k: Key tensor to write to cache [batch, kv_heads, seq_k, head_dim]
-            v: Value tensor to write to cache [batch, kv_heads, seq_k, head_dim]
-            layer_id: Layer ID (for future use with cache_managers)
-            kv_accessor: DenseKVCacheAccessor for KV cache access
-            softmax_scale: Scale factor for softmax (default: 1/sqrt(head_dim))
-            cache_length: Total cache length (uses self._cache_length if None)
-            block_length: Block length to replace (uses self._block_length if None)
-
-        Returns:
-            Attention output tensor [batch, heads, seq_q, head_dim]
-        """
-        if softmax_scale is None:
-            softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
-
-        # Use provided values or fall back to instance values
-        if cache_length is None:
-            cache_length = self._cache_length
-        if block_length is None:
-            block_length = self._block_length
-
-        if cache_length is None or block_length is None:
-            raise ValueError(
-                "cache_length and block_length must be provided either as arguments "
-                "or through prepare_for_dllm_decode()"
-            )
-
-        # 1. Update KV cache: replace last block_length positions
-        # Note: In-place index assignment is CUDA graph safe if tensor addresses are fixed
-        cache_k = kv_accessor.k  # [batch, kv_heads, seq, head_dim]
-        cache_v = kv_accessor.v
-
-        replace_start = cache_length - block_length
-        replace_end = cache_length
-
-        # In-place update (graph-safe if tensor addresses are fixed)
-        cache_k[:, :, replace_start:replace_end, :] = k
-        cache_v[:, :, replace_start:replace_end, :] = v
-
-        # 2. Execute bidirectional attention over full cache
-        if has_flash_attn:
-            # flash_attn_func expects [batch, seqlen, nheads, headdim]
-            q_t = q.transpose(1, 2)
-            k_t = cache_k.transpose(1, 2)
-            v_t = cache_v.transpose(1, 2)
-
-            output = flash_attn.flash_attn_func(
-                q_t, k_t, v_t,
-                causal=False,
-                softmax_scale=softmax_scale,
-            )
-            return output.transpose(1, 2)
-        else:
-            return F.scaled_dot_product_attention(
-                q, cache_k, cache_v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=softmax_scale,
-            )
-
-    def dllm_decode_attention_paged(
-        self,
-        q: torch.Tensor,  # [batch, heads, seq_q, head_dim]
-        k: torch.Tensor,  # [batch, kv_heads, seq_k, head_dim]
-        v: torch.Tensor,  # [batch, kv_heads, seq_k, head_dim]
-        layer_id: int,
-        kv_accessor: PagedKVCacheAccessor,
-        *,
-        decoding_start_list: list[int],
-        softmax_scale: Optional[float] = None,
-        cache_length: Optional[int] = None,
-        block_length: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        dLLM decode attention with PagedKVCacheAccessor.
-
-        This method is designed to be CUDA graph compatible:
-        1. Updates paged KV cache using append_to_paged_kv_cache (triton kernel, graph-safe)
-        2. Executes bidirectional attention using flash_attn_with_kvcache
-
-        For dLLM, we REPLACE KV at specific positions (decoding_start to decoding_start + block_length),
-        not append. This is achieved by passing the correct position_ids.
-
-        Args:
-            q: Query tensor [batch, heads, seq_q, head_dim]
-            k: Key tensor to write to cache [batch, kv_heads, seq_k, head_dim]
-            v: Value tensor to write to cache [batch, kv_heads, seq_k, head_dim]
-            layer_id: Layer ID
-            kv_accessor: PagedKVCacheAccessor for KV cache access
-            decoding_start_list: List of starting positions for each sequence
-            softmax_scale: Scale factor for softmax (default: 1/sqrt(head_dim))
-            cache_length: Total cache length (uses self._cache_length if None)
-            block_length: Block length to replace (uses self._block_length if None)
-
-        Returns:
-            Attention output tensor [batch, heads, seq_q, head_dim]
-        """
-        if softmax_scale is None:
-            softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
-
-        # Use provided values or fall back to instance values
-        if cache_length is None:
-            cache_length = self._cache_length
-        if block_length is None:
-            block_length = self._block_length
-
-        if cache_length is None or block_length is None:
-            raise ValueError(
-                "cache_length and block_length must be provided either as arguments "
-                "or through prepare_for_dllm_decode()"
-            )
-
-        batch_size = q.shape[0]
-        device = q.device
-
-        # 1. Update paged KV cache: replace positions [decoding_start, decoding_start + block_length)
-        # Build delta_position_ids and delta_seq_ids for append_to_paged_kv_cache
-        delta_pos_list = []
-        delta_seq_list = []
-        for i, ds in enumerate(decoding_start_list):
-            for p in range(block_length):
-                delta_pos_list.append(ds + p)
-                delta_seq_list.append(i)
-
-        delta_position_ids = torch.tensor(delta_pos_list, device=device, dtype=torch.long)
-        delta_seq_ids = torch.tensor(delta_seq_list, device=device, dtype=torch.long)
-
-        # k, v shape: [batch, kv_heads, block_length, head_dim]
-        # Need to reshape to [batch * block_length, kv_heads, head_dim] for append_to_paged_kv_cache
-        k_ragged = k.transpose(1, 2).reshape(-1, k.shape[1], k.shape[-1]).contiguous()
-        v_ragged = v.transpose(1, 2).reshape(-1, v.shape[1], v.shape[-1]).contiguous()
-
-        # Write K and V to paged cache
-        for kv_name, kv_tensor in [("k", k_ragged), ("v", v_ragged)]:
-            append_to_paged_kv_cache(
-                kv_accessor.kv[kv_name],
-                kv_accessor.block_table,
-                kv_tensor,
-                delta_position_ids,
-                delta_seq_ids,
-                get_page_ids=kv_accessor.get_page_ids,
-                get_offs_in_page=kv_accessor.get_offs_in_page,
-                use_i64_offsets=kv_accessor.use_i64_offsets,
-            )
-
-        # 2. Execute bidirectional attention using flash_attn_with_kvcache
-        # This reads from the updated paged cache
-        if has_flash_attn:
-            # flash_attn_with_kvcache expects:
-            # q: [batch, seqlen, nheads, headdim]
-            # k_cache, v_cache: paged cache [num_blocks, block_size, nheads, headdim]
-            q_t = q.transpose(1, 2)  # [batch, seq_q, heads, head_dim]
-
-            # Build cache_seqlens: current length of each sequence in the cache
-            cache_seqlens = torch.tensor(
-                [ds + block_length for ds in decoding_start_list],
-                device=device,
-                dtype=torch.int32,
-            )
-
-            # Build kwargs for flash_attn_with_kvcache
-            kwargs = dict(
-                q=q_t,
-                k_cache=kv_accessor.k,  # paged K cache [num_blocks, block_size, kv_heads, head_dim]
-                v_cache=kv_accessor.v,  # paged V cache
-                k=None,  # Already written to cache
-                v=None,
-                cache_seqlens=cache_seqlens,
-                causal=False,  # Bidirectional attention for dLLM
-                softmax_scale=softmax_scale,
-            )
-
-            # Add block_table/page_table based on Flash Attention version
-            if hasattr(self, "_use_fa3") and self._use_fa3:
-                # FA3 uses page_table
-                kwargs["page_table"] = kv_accessor.block_table
-            else:
-                # FA2 uses block_table
-                kwargs["block_table"] = kv_accessor.block_table
-
-            output = self._fa.flash_attn_with_kvcache(**kwargs)
-            # Transpose back to [batch, heads, seq_q, head_dim]
-            return output.transpose(1, 2)
-        else:
-            # Fallback: For paged cache without Flash Attention, we need to gather to dense
-            # This is slower but functional
-            raise NotImplementedError(
-                "dLLM decode with paged KV cache requires Flash Attention. "
-                "Please install flash-attn package."
             )
 
     @override
@@ -1186,207 +721,106 @@ class DLLMAttnBackend(FlashAttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         layer_id: int,
     ) -> torch.Tensor:
-        """
-        Decode phase: read KV from paged cache, compute attention, write back.
-
-        For dLLM, decode operates on block_length tokens at once, replacing
-        KV cache positions [decoding_start, decoding_start + block_length).
-
-        Args:
-            q: Query tensor [batch * block_len, nheads, headdim]
-            kv_cache: PagedKVCacheAccessor
-            k: Key tensor [batch * block_len, nheads_k, headdim]
-            v: Value tensor [batch * block_len, nheads_k, headdim]
-            seq_len_delta: Sequence length delta info
-            layer_id: Layer ID
-
-        Returns:
-            Attention output tensor [batch * block_len, nheads, headdim]
-        """
-        # 存储当前层的 K、V 到预分配的 tensor 中
+        """Decode phase: read KV from paged cache, compute attention, write back."""
         if self._decode_kv_cache is not None:
-            # 直接写入预分配的 tensor，避免 detach().clone()
-            # shape: [num_layers, 2, batch * block_len, n_kv_heads, head_dim]
             self._decode_kv_cache[layer_id, 0].copy_(k)
             self._decode_kv_cache[layer_id, 1].copy_(v)
 
-        # For dLLM decode, we use bidirectional attention over the full cache
-        # The KV cache is already populated from prefill or previous decode steps
-
-        # Get batch dimensions
         block_length = self._block_length or seq_len_delta.delta_max_len
         batch_size = self._batch_size or seq_len_delta.batch_size
         decoding_start_list = self._decoding_start_list
-
-        if decoding_start_list is None:
-            # Fallback: no past KV, just use current K, V
-            block_length = seq_len_delta.delta_max_len
-            batch_size = seq_len_delta.batch_size
-
-            # Reshape from ragged to [batch, block_len, heads, head_dim]
-            q_4d = q.view(batch_size, block_length, q.shape[1], q.shape[2])
-            k_4d = k.view(batch_size, block_length, k.shape[1], k.shape[2])
-            v_4d = v.view(batch_size, block_length, v.shape[1], v.shape[2])
-
-            # Transpose to [batch, heads, seq, head_dim] for attention
-            q_t = q_4d.transpose(1, 2)
-            k_t = k_4d.transpose(1, 2)
-            v_t = v_4d.transpose(1, 2)
-
-            output = self.decode_bidirectional_simple(
-                q_t, k_t, v_t,
-                softmax_scale=1.0 / (q.shape[-1] ** 0.5),
-            )
-
-            output = output.transpose(1, 2)
-            return output.reshape(batch_size * block_length, output.shape[2], output.shape[3])
-
-        # Get dimensions
         n_heads = q.shape[1]
         n_kv_heads = k.shape[1]
         head_dim = q.shape[2]
-        device = q.device
-        dtype = q.dtype
+        device, dtype = q.device, q.dtype
+
+        # No past KV fallback
+        if decoding_start_list is None:
+            q_4d = q.view(batch_size, block_length, n_heads, head_dim).transpose(1, 2)
+            k_4d = k.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
+            v_4d = v.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
+            if n_heads != n_kv_heads:
+                n_rep = n_heads // n_kv_heads
+                k_4d = k_4d.repeat_interleave(n_rep, dim=1)
+                v_4d = v_4d.repeat_interleave(n_rep, dim=1)
+            output = self.decode_bidirectional_simple(q_4d, k_4d, v_4d, softmax_scale=1.0 / (head_dim ** 0.5))
+            return output.transpose(1, 2).reshape(batch_size * block_length, n_heads, head_dim)
 
         # Calculate cache length (aligned to power of 2)
-        current_cache_length = max(decoding_start_list) + block_length
-        def align_exp2(x):
-            return 1 << (x - 1).bit_length() if x > 0 else 1
-        current_cache_length = max(128, align_exp2(current_cache_length))
+        max_ds = max(decoding_start_list)
+        current_cache_length = max(128, 1 << max(0, (max_ds + block_length - 1)).bit_length())
 
-        # Read past KV from paged cache if available
-        # Check if ANY batch has historical KV to read (not just batch 0)
-        if isinstance(kv_cache, PagedKVCacheAccessor) and any(ds > 0 for ds in decoding_start_list):
-            # Build position and sequence IDs for reading past KV
-            pos_list = []
-            seq_list = []
+        # Read past KV from paged cache
+        if isinstance(kv_cache, PagedKVCacheAccessor) and max_ds > 0:
+            pos_list, seq_list = [], []
             for i, ds in enumerate(decoding_start_list):
-                for p in range(ds):
-                    pos_list.append(p)
-                    seq_list.append(i)
+                pos_list.extend(range(ds))
+                seq_list.extend([i] * ds)
 
             if pos_list:
                 position_ids = torch.tensor(pos_list, device=device, dtype=torch.long)
                 seq_ids = torch.tensor(seq_list, device=device, dtype=torch.long)
 
-                # Read past K and V
-                past_k = read_from_paged_kv_cache(
-                    kv_cache.k,
-                    kv_cache.block_table,
-                    position_ids,
-                    seq_ids,
-                )
-                past_v = read_from_paged_kv_cache(
-                    kv_cache.v,
-                    kv_cache.block_table,
-                    position_ids,
-                    seq_ids,
-                )
+                past_k = read_from_paged_kv_cache(kv_cache.k, kv_cache.block_table, position_ids, seq_ids)
+                past_v = read_from_paged_kv_cache(kv_cache.v, kv_cache.block_table, position_ids, seq_ids)
 
-                # Create dense tensors [batch, heads, cache_len, head_dim]
-                past_k_dense = torch.zeros(
-                    batch_size, n_kv_heads, current_cache_length, head_dim,
-                    device=device, dtype=dtype
-                )
-                past_v_dense = torch.zeros(
-                    batch_size, n_kv_heads, current_cache_length, head_dim,
-                    device=device, dtype=dtype
-                )
+                # Create dense tensors and scatter
+                past_k_dense = torch.zeros(batch_size, n_kv_heads, current_cache_length, head_dim, device=device, dtype=dtype)
+                past_v_dense = torch.zeros(batch_size, n_kv_heads, current_cache_length, head_dim, device=device, dtype=dtype)
+                past_k_dense[:, :, :max_ds, :].permute(0, 2, 1, 3)[seq_ids, position_ids, :, :] = past_k
+                past_v_dense[:, :, :max_ds, :].permute(0, 2, 1, 3)[seq_ids, position_ids, :, :] = past_v
 
-                # Scatter ragged to dense
-                # past_k shape: [total_past_tokens, n_kv_heads, head_dim]
-                past_k_dense[:, :, :max(decoding_start_list), :].permute(0, 2, 1, 3)[seq_ids, position_ids, :, :] = past_k
-                past_v_dense[:, :, :max(decoding_start_list), :].permute(0, 2, 1, 3)[seq_ids, position_ids, :, :] = past_v
-
-                # Reshape current K, V to [batch, kv_heads, block_len, head_dim]
                 k_4d = k.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
                 v_4d = v.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
 
-                # Merge past KV with current KV
                 full_k = torch.cat([past_k_dense, k_4d], dim=2)
                 full_v = torch.cat([past_v_dense, v_4d], dim=2)
 
-                # Handle GQA: repeat KV if needed
                 if n_heads != n_kv_heads:
                     n_rep = n_heads // n_kv_heads
                     full_k = full_k.repeat_interleave(n_rep, dim=1)
                     full_v = full_v.repeat_interleave(n_rep, dim=1)
 
-                # Reshape Q to [batch, heads, block_len, head_dim]
                 q_4d = q.view(batch_size, block_length, n_heads, head_dim).transpose(1, 2)
-
-                # Compute bidirectional attention
-                output = self.decode_bidirectional_simple(
-                    q_4d, full_k, full_v,
-                    softmax_scale=1.0 / (head_dim ** 0.5),
-                )
-
-                # Transpose back to ragged format
-                output = output.transpose(1, 2)  # [batch, block_len, heads, head_dim]
-                return output.reshape(batch_size * block_length, n_heads, head_dim)
+                output = self.decode_bidirectional_simple(q_4d, full_k, full_v, softmax_scale=1.0 / (head_dim ** 0.5))
+                return output.transpose(1, 2).reshape(batch_size * block_length, n_heads, head_dim)
 
         # No past KV, just use current K, V
         q_4d = q.view(batch_size, block_length, n_heads, head_dim).transpose(1, 2)
         k_4d = k.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
         v_4d = v.view(batch_size, block_length, n_kv_heads, head_dim).transpose(1, 2)
 
-        # Handle GQA
         if n_heads != n_kv_heads:
             n_rep = n_heads // n_kv_heads
             k_4d = k_4d.repeat_interleave(n_rep, dim=1)
             v_4d = v_4d.repeat_interleave(n_rep, dim=1)
 
-        output = self.decode_bidirectional_simple(
-            q_4d, k_4d, v_4d,
-            softmax_scale=1.0 / (head_dim ** 0.5),
-        )
+        output = self.decode_bidirectional_simple(q_4d, k_4d, v_4d, softmax_scale=1.0 / (head_dim ** 0.5))
+        return output.transpose(1, 2).reshape(batch_size * block_length, n_heads, head_dim)
 
-        output = output.transpose(1, 2)
-        return output.reshape(batch_size * block_length, n_heads, head_dim)
-
-    def write_finished_kv_cache(
-        self,
-        block_finished: torch.Tensor,
-        batch_size: int,
-    ):
-        """
-        Write KV cache for finished blocks to paged cache.
-
-        This should be called after decode attention when some blocks are finished.
-        Only writes KV for sequences where block_finished is True.
-
-        Args:
-            block_finished: Boolean tensor [batch_size] indicating which sequences finished their block
-            batch_size: Batch size
-        """
+    def write_finished_kv_cache(self, block_finished: torch.Tensor, batch_size: int):
+        """Write KV cache for finished blocks to paged cache."""
         if not block_finished.any() or self._decode_kv_cache is None:
             return
 
-        # 获取已完成 batch 的索引
         finished_indices = block_finished.nonzero(as_tuple=True)[0].tolist()
         if not finished_indices:
             return
 
         device = self._decode_kv_cache.device
-        n_kv_heads = self._kv_heads
-        head_dim = self._head_dim
+        n_kv_heads, head_dim = self._kv_heads, self._head_dim
 
-        # 预构建 position_ids 和 seq_ids（所有层共用）
-        delta_pos_list = []
-        delta_seq_list = []
-        for orig_idx in finished_indices:
-            ds = self._decoding_start_list[orig_idx]
+        # Build position_ids and seq_ids (shared across all layers)
+        delta_pos_list, delta_seq_list = [], []
+        for idx in finished_indices:
+            ds = self._decoding_start_list[idx]
             delta_pos_list.extend(range(ds, ds + self._block_length))
-            delta_seq_list.extend([orig_idx] * self._block_length)  # Use orig_idx to index into full batch block_table
+            delta_seq_list.extend([idx] * self._block_length)
 
         delta_position_ids = torch.tensor(delta_pos_list, device=device, dtype=torch.long)
         delta_seq_ids = torch.tensor(delta_seq_list, device=device, dtype=torch.long)
 
-        # 遍历每一层
         for layer_id in range(self._num_layers):
-            # 从预分配的 tensor 中获取 K、V
-            # shape: [num_layers, 2, max_batch * max_block_len, n_kv_heads, head_dim]
-            # 只取当前 batch_size * block_length 大小的数据
             kv_size = batch_size * self._block_length
             layer_k = self._decode_kv_cache[layer_id, 0, :kv_size]
             layer_v = self._decode_kv_cache[layer_id, 1, :kv_size]
@@ -1397,31 +831,18 @@ class DLLMAttnBackend(FlashAttnBackend):
                 except KeyError:
                     continue
 
-                # 提取已完成 batch 的 K、V
-                # layer_k, layer_v: [batch * block_len, n_kv_heads, head_dim]
                 finished_k = layer_k.view(batch_size, self._block_length, n_kv_heads, head_dim)[finished_indices]
                 finished_v = layer_v.view(batch_size, self._block_length, n_kv_heads, head_dim)[finished_indices]
 
-                # 写入 K
+                kv_reshaped = finished_k.reshape(-1, n_kv_heads, head_dim).contiguous()
                 append_to_paged_kv_cache(
-                    accessor.k,
-                    accessor.block_table,
-                    finished_k.reshape(-1, n_kv_heads, head_dim).contiguous(),
-                    delta_position_ids,
-                    delta_seq_ids,
-                    get_page_ids=accessor.get_page_ids,
-                    get_offs_in_page=accessor.get_offs_in_page,
-                    use_i64_offsets=accessor.use_i64_offsets,
-                )
-                # 写入 V
+                    accessor.k, accessor.block_table, kv_reshaped, delta_position_ids, delta_seq_ids,
+                    get_page_ids=accessor.get_page_ids, get_offs_in_page=accessor.get_offs_in_page,
+                    use_i64_offsets=accessor.use_i64_offsets)
+
+                kv_reshaped = finished_v.reshape(-1, n_kv_heads, head_dim).contiguous()
                 append_to_paged_kv_cache(
-                    accessor.v,
-                    accessor.block_table,
-                    finished_v.reshape(-1, n_kv_heads, head_dim).contiguous(),
-                    delta_position_ids,
-                    delta_seq_ids,
-                    get_page_ids=accessor.get_page_ids,
-                    get_offs_in_page=accessor.get_offs_in_page,
-                    use_i64_offsets=accessor.use_i64_offsets,
-                )
+                    accessor.v, accessor.block_table, kv_reshaped, delta_position_ids, delta_seq_ids,
+                    get_page_ids=accessor.get_page_ids, get_offs_in_page=accessor.get_offs_in_page,
+                    use_i64_offsets=accessor.use_i64_offsets)
 
