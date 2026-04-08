@@ -1,33 +1,9 @@
-# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-LLaDA V2 Model Implementation - Inherits from TransformerHFLlama
 
-This module provides LLaDA (Diffusion Large Language Model) support with:
-- Bidirectional attention (non-causal)
-- MoE (Mixture of Experts) support
-- KV-Cache replacement mode for iterative decoding
-- Tensor Parallelism support
-
-Checkpoint structure:
-- word_embeddings.weight: Embedding
-- lm_head.weight: Output projection
-- norm.weight: Final layer norm
-- layers.{i}.input_layernorm.weight
-- layers.{i}.post_attention_layernorm.weight
-- layers.{i}.attention.query_key_value.weight: Merged QKV projection
-- layers.{i}.attention.query_layernorm.weight: LayerNorm for Q
-- layers.{i}.attention.key_layernorm.weight: LayerNorm for K
-- layers.{i}.attention.dense.weight: Output projection
-- layers.{i}.mlp.gate_proj.weight / up_proj.weight / down_proj.weight (Dense)
-- layers.{i}.mlp.experts.{e}.gate_proj.weight / up_proj.weight / down_proj.weight (MoE)
-"""
-
-import functools
 from collections import OrderedDict
-from dataclasses import dataclass
 from logging import getLogger
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
@@ -38,15 +14,13 @@ from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend, DLLMAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase, DenseKVCacheAccessor
+from chitu.cache_manager import KVCacheManagerBase
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.dllm.decoder import DLLMDecoder
-from chitu.static_tensor import StaticTensor
 from chitu.task_type import TaskType
 from chitu.models.model import MoeGate, ParallelMoeBlock, RMSNorm, TransformerBlock, get_linear_layout_contig_y
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
-    FeedForwardHFLlama,
     TransformerBlockHFLlama,
     TransformerHFLlama,
     get_rms_norm_impl,
@@ -57,7 +31,6 @@ from chitu.ops import apply_rotary_pos_emb, silu_and_mul
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
-    get_quant_kwargs_from_checkpoint_prefix,
 )
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
@@ -68,7 +41,6 @@ from chitu.distributed.parallel_state import (
     get_ep_size,
     get_ep_group,
     get_tp_size,
-    get_tp_group,
     get_etp_size,
     get_etp_group,
 )
@@ -78,12 +50,6 @@ from chitu.utils import parse_dtype
 
 logger = getLogger(__name__)
 
-
-@dataclass
-class DLLMModelOutput:
-    """Output from dLLM forward pass."""
-    logits: torch.Tensor
-    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
 
 class AttentionLLaDA2(AttentionHFLlama):
     """LLaDA Attention with merged QKV and QK LayerNorm.
@@ -611,130 +577,32 @@ class TransformerLLaDA2(TransformerHFLlama):
             eos_id=self.eos_id,
         )
 
-        # CUDA Graph related attributes for decode_dllm (Step 0: add first, not used yet)
-        self._decode_dllm_graphs = {}  # key -> CUDAGraph
-        self._static_tensors = {}  # Static tensor storage
+        # CUDA Graph related attributes
         self._do_decode_dllm_forward = None  # CUDA Graph wrapped forward function
-        self._cached_freqs_cis = None  # Cached freqs_cis for graph capture/replay
 
         logger.info(
             f"TransformerLLaDAV2 initialized with mask_id={self.mask_id}, "
             f"block_length={self.block_length}, threshold={self.threshold}"
         )
 
-    def _init_static_tensors_for_decode(
-        self,
-        max_batch_size: int,
-        block_length: int,
-    ):
-        """Initialize static tensors for decode phase.
+    def _get_head_kv_params(self):
+        """Get head dimension and KV head parameters (cached)."""
+        if not hasattr(self, "_head_kv_params"):
+            head_dim = getattr(self.params, "head_dim", self.params.dim // self.params.n_heads)
+            n_kv_heads = self.params.n_kv_heads or self.params.n_heads
+            n_local_kv_heads = n_kv_heads // get_tp_size() if n_kv_heads >= get_tp_size() else 1
+            self._head_kv_params = (head_dim, n_kv_heads, n_local_kv_heads)
+        return self._head_kv_params
 
-        Args:
-            max_batch_size: Maximum batch size for decode
-            block_length: Length of decode block
-        """
-        device = next(self.parameters()).device
-        dtype = self.embed_tokens.weight.dtype
-
-        # Calculate maximum number of elements
+    def _init_cuda_graph_decode(self, max_batch_size: int, block_length: int):
+        """Initialize CUDA Graph for decode_dllm."""
         tokens_max_nelem = max_batch_size * block_length
-        hidden_dim = self.params.dim
-
-        # Input static tensor: tokens [batch * block_len]
-        self._static_tensors["decode_tokens"] = StaticTensor(
-            torch.empty(tokens_max_nelem, dtype=torch.long, device=device),
-            max_nelem=tokens_max_nelem,
-        )
-
-        # Output static tensor: hidden states [batch * block_len, hidden_dim]
-        self._static_tensors["decode_hidden"] = StaticTensor(
-            torch.empty(tokens_max_nelem, hidden_dim, dtype=dtype, device=device),
-            max_nelem=tokens_max_nelem * hidden_dim,
-        )
-
-        # Logits output [batch, block_len, vocab_size/tp]
-        vocab_size = self.params.vocab_size // get_tp_size()
-        self._static_tensors["decode_logits"] = StaticTensor(
-            torch.empty(max_batch_size, block_length, vocab_size, dtype=torch.float32, device=device),
-            max_nelem=max_batch_size * block_length * vocab_size,
-        )
-
-        self._max_batch_size = max_batch_size
-        self._block_length = block_length
-
-    def _set_decode_input(self, tokens: torch.Tensor):
-        """Set decode input to static tensor.
-
-        Args:
-            tokens: Input token tensor [batch * block_len]
-        """
-        self._static_tensors["decode_tokens"].set(tokens)
-
-    def _get_decode_output(self) -> torch.Tensor:
-        """Get decode output from static tensor.
-
-        Returns:
-            Logits tensor [batch, block_len, vocab_size/tp]
-        """
-        return self._static_tensors["decode_logits"].get()
-
-    def _init_cuda_graph_decode(self, max_batch_size: int, block_length: int, skip_attn_backend_init: bool = False):
-        """Initialize CUDA Graph for decode_dllm.
-
-        Args:
-            max_batch_size: Maximum batch size for decode
-            block_length: Length of decode block
-            skip_attn_backend_init: Skip attn_backend initialization (if already done)
-        """
-        # Initialize static tensors if not already done
-        if 'decode_tokens' not in self._static_tensors:
-            self._init_static_tensors_for_decode(max_batch_size, block_length)
-
-        # Initialize attn_backend static tensors for CUDA Graph
-        if not skip_attn_backend_init:
-            head_dim = (
-                self.params.head_dim
-                if hasattr(self.params, "head_dim")
-                else self.params.dim // self.params.n_heads
-            )
-            n_kv_heads = (
-                self.params.n_heads
-                if self.params.n_kv_heads is None
-                else self.params.n_kv_heads
-            )
-            n_local_kv_heads = (
-                n_kv_heads // get_tp_size()
-                if n_kv_heads >= get_tp_size()
-                else 1
-            )
-            device = next(self.parameters()).device
-            dtype = self.embed_tokens.weight.dtype
-            max_cache_length = self._max_position_embeddings
-
-            self.attn_backend.init_static_tensors_for_decode(
-                max_batch_size=max_batch_size,
-                max_cache_length=max_cache_length,
-                kv_heads=n_local_kv_heads,
-                head_dim=head_dim,
-                num_layers=len(self.layers),
-                device=device,
-                dtype=dtype,
-            )
-
-        tokens_max_nelem = max_batch_size * block_length
-        # Note: lm_head uses ColumnParallelLinear with gather_output=True,
-        # so the output is the full vocab_size, not vocab_size/tp
-        vocab_size = self.params.vocab_size
-
-        def output_max_nelem_callback(key, output):
-            # output: [batch * block_len, vocab_size] (full vocab after gather)
-            return max_batch_size * block_length * vocab_size
+        vocab_size = self.params.vocab_size  # Full vocab (gather_output=True in lm_head)
 
         @make_dispatched_graphed_callables(
             args_max_nelem=(tokens_max_nelem,),
             kwargs_max_nelem={},
-            output_max_nelem_callback=output_max_nelem_callback,
-            before_capture_callback=self._before_decode_capture,
+            output_max_nelem_callback=lambda key, output: max_batch_size * block_length * vocab_size,
             before_replay_callback=self._before_decode_replay,
             enable=self.use_cuda_graph,
         )
@@ -743,18 +611,8 @@ class TransformerLLaDA2(TransformerHFLlama):
 
         self._do_decode_dllm_forward = do_decode_dllm_forward
 
-    def _before_decode_capture(self):
-        """Callback before CUDA Graph capture."""
-        # Ensure attention backend is ready for capture
-        pass
-
     def _before_decode_replay(self, graph):
-        """Callback before CUDA Graph replay.
-
-        Args:
-            graph: The CUDAGraph object about to be replayed
-        """
-        # Update attn_backend static tensors before replay
+        """Callback before CUDA Graph replay."""
         if hasattr(self, '_decoding_start_list_for_graph'):
             self.attn_backend.update_static_tensors_for_decode(
                 decoding_start_list=self._decoding_start_list_for_graph,
@@ -762,27 +620,12 @@ class TransformerLLaDA2(TransformerHFLlama):
             )
 
     def _decode_dllm_core(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Core forward computation for decode_dllm (graph-safe).
-
-        This method contains only the forward computation without
-        any prepare operations that need to happen outside the graph.
-
-        Args:
-            tokens: Flattened token IDs [batch_size * block_length]
-
-        Returns:
-            Logits [batch_size * block_length, vocab_size/tp]
-        """
+        """Core forward computation for decode_dllm (graph-safe)."""
         h = self._pre_layers(tokens)
-
-        # Get freqs_cis dynamically inside the graph (CUDA Graph safe indexing)
         freqs_cis = self.prepare_freqs_cis()
-
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             h = layer(h, freqs_cis)
-
-        h = self._post_layers(h)
-        return h
+        return self._post_layers(h)
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
@@ -989,8 +832,6 @@ class TransformerLLaDA2(TransformerHFLlama):
     ) -> torch.Tensor:
         """dLLM decode with bidirectional attention.
 
-        Reuses parent class methods for dLLM decode phase.
-
         Args:
             tokens: Flattened token IDs [batch_size * block_length]
             decoding_start_list: List of starting positions for each sequence
@@ -1000,23 +841,7 @@ class TransformerLLaDA2(TransformerHFLlama):
             Logits [batch_size, block_length, vocab_size]
         """
         batch_size = len(decoding_start_list)
-
-        # Get layer parameters from params
-        head_dim = (
-            self.params.head_dim
-            if hasattr(self.params, "head_dim")
-            else self.params.dim // self.params.n_heads
-        )
-        n_kv_heads = (
-            self.params.n_heads
-            if self.params.n_kv_heads is None
-            else self.params.n_kv_heads
-        )
-        n_local_kv_heads = (
-            n_kv_heads // get_tp_size()
-            if n_kv_heads >= get_tp_size()
-            else 1
-        )
+        head_dim, n_kv_heads, n_local_kv_heads = self._get_head_kv_params()
         dtype = self.embed_tokens.weight.dtype
 
         # Prepare attn_backend
@@ -1035,76 +860,48 @@ class TransformerLLaDA2(TransformerHFLlama):
         # Set seq_len_delta for prepare_freqs_cis
         new_lens = [ds + block_length for ds in decoding_start_list]
         for mgr in self.cache_managers.values():
-            mgr.seq_len_delta.copy_from_list(
-                decoding_start_list,  # old_lens
-                new_lens,  # new_lens
-            )
+            mgr.seq_len_delta.copy_from_list(decoding_start_list, new_lens)
 
-        # === Step 4: CUDA Graph support with KV Cache 静态化 ===
         # Save state for before_replay callback
         self._decoding_start_list_for_graph = decoding_start_list
         self._batch_size_for_graph = batch_size
 
         # Initialize CUDA Graph on first call
         if self.use_cuda_graph and self._do_decode_dllm_forward is None:
-            # Initialize attn_backend static tensors first
-            head_dim = (
-                self.params.head_dim
-                if hasattr(self.params, "head_dim")
-                else self.params.dim // self.params.n_heads
-            )
-            n_kv_heads = (
-                self.params.n_heads
-                if self.params.n_kv_heads is None
-                else self.params.n_kv_heads
-            )
-            n_local_kv_heads = (
-                n_kv_heads // get_tp_size()
-                if n_kv_heads >= get_tp_size()
-                else 1
-            )
-            device = next(self.parameters()).device
-            dtype = self.embed_tokens.weight.dtype
-
             self.attn_backend.init_static_tensors_for_decode(
                 max_batch_size=self.max_batch_size_per_dp,
                 max_cache_length=self._max_position_embeddings,
                 kv_heads=n_local_kv_heads,
                 head_dim=head_dim,
                 num_layers=len(self.layers),
-                device=device,
+                device=next(self.parameters()).device,
                 dtype=dtype,
             )
-            # Update static tensors before warmup
             self.attn_backend.update_static_tensors_for_decode(
                 decoding_start_list=decoding_start_list,
                 batch_size=batch_size,
             )
-            # Now initialize CUDA Graph (will trigger warmup)
             self._init_cuda_graph_decode(
                 max_batch_size=self.max_batch_size_per_dp,
                 block_length=block_length,
-                skip_attn_backend_init=True,  # Skip re-initialization
             )
 
-        # Update static tensors before each forward (for replay)
+        # Run forward
         if self._do_decode_dllm_forward is not None:
             self.attn_backend.update_static_tensors_for_decode(
                 decoding_start_list=decoding_start_list,
                 batch_size=batch_size,
             )
-            key = (batch_size,)
-            h = self._do_decode_dllm_forward(key, tokens)
+            h = self._do_decode_dllm_forward((batch_size,), tokens)
         else:
             h = self._pre_layers(tokens)
             freqs_cis = self.prepare_freqs_cis()
             for layer in self.layers:
                 h = layer(h, freqs_cis)
             h = self._post_layers(h)
-        # ====================================
 
         h = h.float()
-        return h.view(batch_size, block_length, -1)  # [batch, block_len, vocab]
+        return h.view(batch_size, block_length, -1)
 
     def forward(
         self,
