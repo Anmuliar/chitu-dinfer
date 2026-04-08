@@ -10,4 +10,4 @@
     infer.max_reqs=1 \
     infer.max_seq_len=1200 \
     request.max_new_tokens=1024 \
-    infer.use_cuda_graph=True >& chitu_run.log
+    infer.use_cuda_graph=False >& chitu_run.log

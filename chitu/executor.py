@@ -1306,6 +1306,7 @@ class Executor:
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
         block_length = get_global_args().infer.dllm_block_length
+        num_tokens = tasks.num_tokens  # Define early to avoid undefined error
         prefilling_lengths: list[int] = []
 
         if not is_empty_step:
@@ -1318,7 +1319,6 @@ class Executor:
                 mgr.prepare_cache_prefill(tasks.req_ids, prefilling_lengths)
             PrometheusMetricsCollector.update_kvcache_usage()
 
-            num_tokens = tasks.num_tokens
             if (self.rank == 0 and num_tokens > 0) or (self.dp_size > 1 and self.pp_stage == 0):
                 payload = torch.from_numpy(np.concatenate(tasks.tokens)).to(self.device).to(torch.int64)
             else:
@@ -1346,6 +1346,7 @@ class Executor:
             return self.dummy_output
 
         batch_size = tasks.num_tasks
+        # Create block-diagonal attention mask (shared across batch)
         bd_attn_mask = torch.tril(
             torch.ones(max_prefilling_length, max_prefilling_length, device="cuda", dtype=torch.bool)
         ).unsqueeze(0).expand(batch_size, -1, -1)
@@ -1354,7 +1355,7 @@ class Executor:
         logits = Backend.model.prefill_dllm(
             token_array[:, :max_prefilling_length].flatten(),
             output_token_offsets,
-            attention_mask=bd_attn_mask[:, :max_prefilling_length, :max_prefilling_length],
+            attention_mask=bd_attn_mask,
             prefilling_lengths=prefilling_lengths,
         )
 
@@ -1416,12 +1417,10 @@ class Executor:
         col_indices = torch.arange(block_length, device=self.device).unsqueeze(0) + decoding_start_t.unsqueeze(1)
         tokens.scatter_(1, col_indices, decoding_block)
         decoder.batch_decode(logits, decoding_start_t, tokens, block_length)
-        torch.cuda.synchronize()
 
-        # 6) Check block_finished and write KV
-        decoded_block = tokens[torch.arange(batch_size, device=self.device).unsqueeze(1),
-                               decoding_start_t.unsqueeze(1) + torch.arange(block_length, device=self.device).unsqueeze(0)]
-        block_finished = (decoded_block == mask_id).sum(dim=1) == 0
+        # 6) Extract decoded blocks and check block_finished (reuse col_indices)
+        decoded_blocks = tokens.gather(1, col_indices)  # [batch_size, block_length]
+        block_finished = (decoded_blocks == mask_id).sum(dim=1) == 0
         if block_finished.any():
             Backend.model.attn_backend.write_finished_kv_cache(block_finished, batch_size)
         torch.cuda.synchronize()
@@ -1433,7 +1432,6 @@ class Executor:
 
         # 8) Update task state (main rank only)
         if self.is_main_rank and isinstance(tasks, PackedTasks):
-            decoded_blocks = tokens.gather(1, col_indices)
             has_eos = (decoded_blocks == eos_id).any(dim=1)
             has_eos_list = has_eos.cpu().tolist()
             block_finished_list = block_finished.cpu().tolist()
