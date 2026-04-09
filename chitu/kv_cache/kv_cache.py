@@ -463,8 +463,18 @@ class KVCacheBase:
         decoding_start: torch.Tensor,
         block_length: int,
     ):
-        """Prepare cache for DLLM decode. Override in PagedKVCache."""
+        """Prepare cache for DLLM decode.
+
+        Args:
+            tasks: PackedTasks containing task information
+            decoding_start: Tensor of starting positions for each sequence
+            block_length: Length of decode block
+        """
         self.curr_req_ids = tasks.task_ids
+
+        # Set up seq_len_delta based on decoding_start + block_length
+        new_lens = decoding_start + block_length
+        self.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
 
     def finalize_cache_single_decode_dllm(
         self, req_ids: list[str], block_finished: torch.Tensor, block_length: int
@@ -686,27 +696,8 @@ class PagedKVCache(KVCacheBase):
             tasks: PackedTasks containing new_cache_ids_list
             prefilling_lengths: Actual prefilling lengths for each task
         """
-        self.curr_tids = tasks.task_ids
-
-        # Set up seq_len_delta based on prefilling_lengths
-        prev_seq_len = BatchedSeqLen(
-            [0] * len(tasks.task_ids),
-            device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
-        )
-        next_seq_len = BatchedSeqLen(
-            prefilling_lengths,
-            device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
-        )
-        self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
-
-        for tid, seq_len in zip(tasks.task_ids, prefilling_lengths):
-            self.tid_to_cached_len[tid] = seq_len
+        # Call base class to set up seq_len_delta and tid_to_cached_len
+        super().prepare_cache_prefill_dllm(tasks, prefilling_lengths)
 
         # Receive pre-allocated block indices from scheduler
         if tasks.new_cache_ids_list:
@@ -735,9 +726,8 @@ class PagedKVCache(KVCacheBase):
         Similar to prepare_cache_decode, this receives new_cache_ids_list from scheduler
         and updates block_table accordingly.
         """
-        self.curr_req_ids = tasks.task_ids
-        new_lens = decoding_start + block_length
-        self.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
+        # Call base class to set curr_req_ids and seq_len_delta
+        super().prepare_cache_decode_dllm(tasks, decoding_start, block_length)
 
         # Receive pre-allocated block indices from scheduler (via new_cache_ids_list)
         if tasks.new_cache_ids_list:
