@@ -632,7 +632,7 @@ class Task:
             self.next_token = int(self.next_token.cpu().item())
         if self.next_token == -1:
             return
-has_update = is_decode(self.task_type) or self.evicting
+        has_update = is_decode(self.task_type) or self.evicting
         if has_update:
             if Backend.executor.mtp_size > 1:
                 self.prefix_tokens.extend(self.mtp_token_list)
@@ -787,7 +787,7 @@ has_update = is_decode(self.task_type) or self.evicting
     def has_next_token(self):
         return self.next_token >= 0
 
-@property
+    @property
     def kv_cache_len_used_in_completed_steps(self):
         """在以往step中已经缓存到kv cache中的token长度"""
         if is_prefill(self.task_type):
