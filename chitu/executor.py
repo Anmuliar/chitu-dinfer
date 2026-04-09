@@ -1376,19 +1376,22 @@ class Executor:
         mask_id, eos_id = decoder.mask_id, decoder.eos_id
         batch_size = tasks.num_tasks
 
-        # 1) Get decoding_start_list (broadcast for TP>1)
+        # 1) Get decoding_start tensor (broadcast for TP>1)
         if self.tp_size > 1:
             tp_group = get_tp_group()
             if isinstance(tasks, PackedTasks):
-                decoding_start_list = [getattr(t, "decoding_start", 0) for t in tasks.tasks]
-                decoding_start_t = torch.tensor(decoding_start_list, device=self.device, dtype=torch.long)
+                decoding_start = torch.tensor(
+                    [getattr(t, "decoding_start", 0) for t in tasks.tasks],
+                    device=self.device, dtype=torch.long
+                )
             else:
-                decoding_start_t = torch.empty(batch_size, device=self.device, dtype=torch.long)
-            torch.distributed.broadcast(decoding_start_t, src=tp_group.rank_list[0], group=tp_group.gpu_group)
-            decoding_start_list = decoding_start_t.cpu().tolist()
+                decoding_start = torch.empty(batch_size, device=self.device, dtype=torch.long)
+            torch.distributed.broadcast(decoding_start, src=tp_group.rank_list[0], group=tp_group.gpu_group)
         else:
-            decoding_start_list = [getattr(t, "decoding_start", 0) for t in tasks.tasks]
-            decoding_start_t = torch.tensor(decoding_start_list, device=self.device, dtype=torch.long)
+            decoding_start = torch.tensor(
+                [getattr(t, "decoding_start", 0) for t in tasks.tasks],
+                device=self.device, dtype=torch.long
+            )
 
         # 2) Prepare payload
         if (self.is_main_rank or (self.dp_size > 1 and self.dp_dispatcher is not None)) and isinstance(tasks, PackedTasks):
@@ -1402,21 +1405,21 @@ class Executor:
         self._kv_hook.before_decode_step(tasks.req_ids)
         for mgr in Backend.cache_managers.values():
             if hasattr(mgr, "prepare_cache_decode_dllm"):
-                mgr.prepare_cache_decode_dllm(tasks.req_ids, decoding_start_list, block_length)
+                mgr.prepare_cache_decode_dllm(tasks.req_ids, decoding_start, block_length)
         PrometheusMetricsCollector.update_kvcache_usage()
 
         # 4) Model forward
         decoding_block = payload.view(batch_size, block_length)
-        logits = Backend.model.decode_dllm(decoding_block.flatten(), decoding_start_list=decoding_start_list, block_length=block_length)
+        logits = Backend.model.decode_dllm(decoding_block.flatten(), decoding_start=decoding_start, block_length=block_length)
         if logits.shape[0] != batch_size:
             logits = logits[:batch_size, ...]
 
         # 5) batch_decode: update block tokens
-        total_len = max(decoding_start_list) + block_length
+        total_len = decoding_start.max().item() + block_length
         tokens = torch.full((batch_size, total_len), mask_id, dtype=torch.long, device=self.device)
-        col_indices = torch.arange(block_length, device=self.device).unsqueeze(0) + decoding_start_t.unsqueeze(1)
+        col_indices = torch.arange(block_length, device=self.device).unsqueeze(0) + decoding_start.unsqueeze(1)
         tokens.scatter_(1, col_indices, decoding_block)
-        decoder.batch_decode(logits, decoding_start_t, tokens, block_length)
+        decoder.batch_decode(logits, decoding_start, tokens, block_length)
 
         # 6) Extract decoded blocks and check block_finished (reuse col_indices)
         decoded_blocks = tokens.gather(1, col_indices)  # [batch_size, block_length]
@@ -1442,7 +1445,8 @@ class Executor:
                 task.next_block = block_slice.cpu().tolist()
 
                 if block_finished_list[i]:
-                    skip = max(0, min(task.prompt_len, decoding_start_list[i] + block_length) - decoding_start_list[i])
+                    ds_i = decoding_start[i].item()
+                    skip = max(0, min(task.prompt_len, ds_i + block_length) - ds_i)
                     block_skip_prompt_tokens.append(skip)
                     task.decoding_start += block_length
                     block_finished_tasks.append(task)

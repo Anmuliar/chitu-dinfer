@@ -411,7 +411,7 @@ class KVCacheManagerBase:
         self.curr_req_ids = None
 
     def prepare_cache_decode_dllm(
-        self, req_ids: list[str], decoding_start_list: list[int], block_length: int
+        self, req_ids: list[str], decoding_start: torch.Tensor, block_length: int
     ):
         """Prepare cache for DLLM decode. Override in PagedKVCacheManager."""
         self.curr_req_ids = req_ids
@@ -723,15 +723,22 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self._upd_gpu_block_table(req_ids)
 
     def prepare_cache_decode_dllm(
-        self, req_ids: list[str], decoding_start_list: list[int], block_length: int
+        self, req_ids: list[str], decoding_start: torch.Tensor, block_length: int
     ):
         """Prepare cache for DLLM decode: reserve blocks for decoding_start + block_length.
-        Does NOT update req_id_to_seq_len (caller updates when block finishes)."""
+        Does NOT update req_id_to_seq_len (caller updates when block finishes).
+
+        Args:
+            req_ids: List of request IDs
+            decoding_start: Tensor of starting positions [batch_size]
+            block_length: Length of each decode block
+        """
         self.curr_req_ids = req_ids
-        self.seq_len_delta.copy_from_list(
-            [decoding_start_list[i] for i in range(len(req_ids))],
-            [decoding_start_list[i] + block_length for i in range(len(req_ids))],
-        )
+        # Use tensor operations for seq_len_delta
+        new_lens = decoding_start + block_length
+        self.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
+
+        decoding_start_list = decoding_start.tolist()
         for i, req_id in enumerate(req_ids):
             target = decoding_start_list[i] + block_length
             num_additional_blocks = self.num_additional_blocks_req_need(req_id, target)

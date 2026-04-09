@@ -613,9 +613,9 @@ class TransformerLLaDA2(TransformerHFLlama):
 
     def _before_decode_replay(self, graph):
         """Callback before CUDA Graph replay."""
-        if hasattr(self, '_decoding_start_list_for_graph'):
+        if hasattr(self, '_decoding_start_for_graph'):
             self.attn_backend.update_static_tensors_for_decode(
-                decoding_start_list=self._decoding_start_list_for_graph,
+                decoding_start=self._decoding_start_for_graph,
                 batch_size=self._batch_size_for_graph,
             )
 
@@ -827,20 +827,20 @@ class TransformerLLaDA2(TransformerHFLlama):
     def decode_dllm(
         self,
         tokens: torch.Tensor,
-        decoding_start_list: list[int],
+        decoding_start: torch.Tensor,
         block_length: int,
     ) -> torch.Tensor:
         """dLLM decode with bidirectional attention.
 
         Args:
             tokens: Flattened token IDs [batch_size * block_length]
-            decoding_start_list: List of starting positions for each sequence
+            decoding_start: Tensor of starting positions for each sequence [batch_size]
             block_length: Length of decode block
 
         Returns:
             Logits [batch_size, block_length, vocab_size]
         """
-        batch_size = len(decoding_start_list)
+        batch_size = decoding_start.shape[0]
         head_dim, n_kv_heads, n_local_kv_heads = self._get_head_kv_params()
         dtype = self.embed_tokens.weight.dtype
 
@@ -848,7 +848,7 @@ class TransformerLLaDA2(TransformerHFLlama):
         self.attn_backend.prepare_decode(
             cache_managers=self.cache_managers,
             num_layers=len(self.layers),
-            decoding_start_list=decoding_start_list,
+            decoding_start=decoding_start,
             block_length=block_length,
             batch_size=batch_size,
             kv_heads=n_local_kv_heads,
@@ -858,12 +858,12 @@ class TransformerLLaDA2(TransformerHFLlama):
         )
 
         # Set seq_len_delta for prepare_freqs_cis
-        new_lens = [ds + block_length for ds in decoding_start_list]
+        new_lens = decoding_start + block_length
         for mgr in self.cache_managers.values():
-            mgr.seq_len_delta.copy_from_list(decoding_start_list, new_lens)
+            mgr.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
 
         # Save state for before_replay callback
-        self._decoding_start_list_for_graph = decoding_start_list
+        self._decoding_start_for_graph = decoding_start
         self._batch_size_for_graph = batch_size
 
         # Initialize CUDA Graph on first call
@@ -878,7 +878,7 @@ class TransformerLLaDA2(TransformerHFLlama):
                 dtype=dtype,
             )
             self.attn_backend.update_static_tensors_for_decode(
-                decoding_start_list=decoding_start_list,
+                decoding_start=decoding_start,
                 batch_size=batch_size,
             )
             self._init_cuda_graph_decode(
@@ -889,7 +889,7 @@ class TransformerLLaDA2(TransformerHFLlama):
         # Run forward
         if self._do_decode_dllm_forward is not None:
             self.attn_backend.update_static_tensors_for_decode(
-                decoding_start_list=decoding_start_list,
+                decoding_start=decoding_start,
                 batch_size=batch_size,
             )
             h = self._do_decode_dllm_forward((batch_size,), tokens)
