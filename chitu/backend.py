@@ -24,6 +24,7 @@ from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
     FlashMLABackend,
+    HopperMixedBackend,
     NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
@@ -31,12 +32,17 @@ from chitu.attn_backend import (
     HybridAttnBackend,
     DLLMAttnBackend,
 )
-from chitu.cache_manager import (
-    DenseKVCacheManager,
+
+from chitu.kv_cache.registry import should_use_hopper_mixed_backend
+from chitu.kv_cache import (
+    KVCacheManagerBase,
     PagedKVCacheManager,
-    SingletonPagedKVCacheManager,
+    PagedKVCache,
+    KVCacheBase,
+    DenseKVCache,
+    SingletonPagedKVCache,
     GlobalLocalMap,
-    MMPagedKVCacheManager,
+    MMPagedKVCache,
 )
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
@@ -70,11 +76,12 @@ from chitu.tokenizer import (
 )
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser, patch_chat_template
-from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
 from chitu.numa_utils import bind_process_to_numa
+from chitu.kv_cache.providers import register_all_providers
+from chitu.kv_cache.builders import build_cache_managers
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
@@ -96,12 +103,11 @@ class Backend:
     # init once
     model = None
     tokenizer = None
-    cache_managers = None
+    cache_dict: dict[str, KVCacheBase] = {}
     formatter = None
     processor = None
     args = None
-    # --- cache_manager related (not used in the current code)
-    curr_req_ids = None
+    curr_tids = None
     cache_type = ""
     # ---
     use_gloo = True
@@ -114,6 +120,9 @@ class Backend:
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
+    cache_managers: Optional[list[dict[str, "KVCacheManagerBase"]]] = (
+        None  # One per each DP rank
+    )
     executor: Optional["Executor"] = None
 
     # mutable
@@ -144,7 +153,6 @@ class Backend:
             from chitu.moe.load_balancer import register_moe_weight_accessor
 
             register_moe_weight_accessor(accessor, get_ep_group())
-            logger.info("Backend: MoE weight accessor installed and registered")
         except Exception as e:
             logger.warning(f"Backend: failed to register MoE weight accessor: {e}")
 
@@ -159,7 +167,6 @@ class Backend:
             try:
                 # Lazy import to avoid circular deps at import time
                 from chitu.moe.load_balancer import ExpertParamAccessor
-                import torch
 
                 class _ModelExpertsAccessor(ExpertParamAccessor):  # type: ignore
 
@@ -221,9 +228,6 @@ class Backend:
 
                 accessor = _ModelExpertsAccessor()
                 Backend.set_moe_weight_accessor(accessor)
-                logger.info(
-                    "Backend: auto-built ModelExpertsAccessor and registered to planner"
-                )
             except Exception as e:
                 logger.warning(
                     f"Backend: failed to build/register ModelExpertsAccessor: {e}"
@@ -280,10 +284,24 @@ class Backend:
         pipeline_parallel_size = args.infer.pp_size
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
+        embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         assert (
             tensor_parallel_size * non_expert_data_parallel_size % expert_parallel_size
             == 0
         )
+        if tensor_parallel_size > 1:
+            assert (
+                embed_tokens_lm_head_tp_size == tensor_parallel_size
+            ), "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
+        elif non_expert_data_parallel_size > 1:
+            assert (
+                non_expert_data_parallel_size % embed_tokens_lm_head_tp_size == 0
+            ), "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
+        else:
+            assert (
+                embed_tokens_lm_head_tp_size == 1
+            ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
+
         expert_tensor_parallel_size = (
             tensor_parallel_size * non_expert_data_parallel_size // expert_parallel_size
         )
@@ -322,6 +340,7 @@ class Backend:
             etp_size=expert_tensor_parallel_size,
             ep_size=expert_parallel_size,
             pp_size=pipeline_parallel_size,
+            embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
         )
         world_group = get_world_group()
         Backend.ip_port_list = world_group.gather_all_rank_ip_port()
@@ -372,9 +391,11 @@ class Backend:
             Initialized tokenizer
         """
         model_name_lower = args.models.name.lower()
-        trust_remote_code = model_name_lower.startswith(
-            "glm-4"
-        ) or model_name_lower.startswith("glm-5")
+        trust_remote_code = (
+            model_name_lower.startswith("glm-4")
+            or model_name_lower.startswith("glm-5")
+            or model_name_lower.startswith("kimi")
+        )
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
@@ -449,434 +470,16 @@ class Backend:
             return ChatFormat(Backend.tokenizer)
 
     @staticmethod
-    def _init_cache_manager(
-        args,
-        attn_backend_type,
-        layer_filter_fn=lambda x: x,
-        num_blocks: int = None,
-    ):
-        """
-        Initialize the appropriate KV cache manager based on configuration.
-
-        Arguments:
-            args: Configuration with cache and model settings
-
-        Returns:
-            Initialized cache manager
-        """
-
-        device = torch.device(
-            "cpu" if args.infer.op_impl == "cpu" else torch.cuda.current_device()
-        )
-        pipeline_parallel_size = args.infer.pp_size
-
-        # Determine layer distribution for pipeline parallelism
-        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
-        total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
-        if pipeline_parallel_size > 1:
-            layer_dist = compute_layer_dist_in_pp(
-                total_n_layers, pipeline_parallel_size
-            )
-            pp_rank = get_pp_group().rank_in_group
-            local_begin_layer_id = sum(layer_dist[:pp_rank])
-            local_end_layer_id = local_begin_layer_id + layer_dist[pp_rank]
-        else:
-            local_begin_layer_id = 0
-            local_end_layer_id = total_n_layers
-
-        local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
-        layer_id_map = GlobalLocalMap.from_list(local_layers)
-
-        # Configure KV cache parameters based on model type
-        kv_cache_kvargs = Backend._get_kv_cache_params(args, attn_backend_type)
-        logger.info(
-            f"{args.infer.cache_type} cache dtype_dict: {kv_cache_kvargs.get('dtype_dict', None)}"
-        )
-        # Create appropriate cache manager
-        if args.infer.cache_type == "paged":
-            if args.infer.attn_type == "npu":
-                block_size = 128
-            elif (
-                args.models.type == ModelType.DEEPSEEK_V3
-                and args.infer.mla_absorb != "none"
-            ):
-                block_size = 64
-            else:
-                block_size = 256
-            return PagedKVCacheManager(
-                layer_id_map,
-                max_seq_len=args.infer.max_seq_len,
-                num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
-                block_size=block_size,
-                num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
-                device=device,
-                **kv_cache_kvargs,
-            )
-        elif args.infer.cache_type == "skew":
-            return DenseKVCacheManager(
-                layer_id_map,
-                max_seq_len=args.infer.max_seq_len,
-                num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
-                device=device,
-                **kv_cache_kvargs,
-            )
-        else:
-            raise ValueError(f"Unknown cache type {args.infer.cache_type}")
-
-    @staticmethod
-    def _init_linear_attn_cache_manager(
-        args, layer_filter_fn=lambda x: x, num_blocks: int = None
-    ):
-        device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
-        pipeline_parallel_size = args.infer.pp_size
-
-        # Determine layer distribution for pipeline parallelism
-        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
-        total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
-        if pipeline_parallel_size > 1:
-            layer_dist = compute_layer_dist_in_pp(
-                total_n_layers, pipeline_parallel_size
-            )
-            pp_rank = get_pp_group().rank_in_group
-            local_begin_layer_id = sum(layer_dist[:pp_rank])
-            local_end_layer_id = local_begin_layer_id + layer_dist[pp_rank]
-        else:
-            local_begin_layer_id = 0
-            local_end_layer_id = total_n_layers
-
-        local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
-        layer_id_map = GlobalLocalMap.from_list(local_layers)
-
-        return SingletonPagedKVCacheManager(
-            layer_id_map,
-            num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
-            shape_per_token_dict=Backend._get_linear_attn_cache_params(args),
-            device=device,
-        )
-
-    @staticmethod
-    def _init_indexer_cache_manager(
-        args, layer_filter_fn=lambda x: x, num_blocks: int = None
-    ):
-        device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
-        pipeline_parallel_size = args.infer.pp_size
-
-        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
-        total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
-        if pipeline_parallel_size > 1:
-            layer_dist = compute_layer_dist_in_pp(
-                total_n_layers, pipeline_parallel_size
-            )
-            pp_rank = get_pp_group().rank_in_group
-            local_begin_layer_id = sum(layer_dist[:pp_rank])
-            local_end_layer_id = local_begin_layer_id + layer_dist[pp_rank]
-        else:
-            local_begin_layer_id = 0
-            local_end_layer_id = total_n_layers
-
-        local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
-        layer_id_map = GlobalLocalMap.from_list(local_layers)
-
-        # Shapes for indexer caches
-        index_head_dim = getattr(args.models, "index_head_dim", None)
-        if index_head_dim is None or index_head_dim <= 0:
-            logger.warning(
-                f"Index head dim is not set or is not positive, skipping indexer cache manager"
-            )
-            return None
-
-        shape_per_token_dict = {
-            "indexer_k": (int(index_head_dim),),
-            "indexer_ks": (int(index_head_dim) // 128,),
-        }
-        dtype_dict = {
-            "indexer_k": torch.float8_e4m3fn,
-            "indexer_ks": torch.float32,
-        }
-
-        # Align page size with main paged KV
-        block_size = 64 if args.infer.mla_absorb != "none" else 256
-        if args.infer.attn_type == "npu":
-            block_size = 128
-
-        # FIXME: for now, we use the same block size as the main paged KV cache manager
-        # Compute sufficient num_blocks for indexer cache when not provided
-        # Ensure enough pages for max_seq_len per hot request to avoid OOB when crossing pages
-        num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
-        mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
-        auto_num_blocks = (
-            ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
-        )
-        num_blocks = (
-            args.infer.num_blocks if args.infer.num_blocks != -1 else auto_num_blocks
-        )
-
-        return PagedKVCacheManager(
-            layer_id_map,
-            max_seq_len=args.infer.max_seq_len,
-            num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
-            // args.infer.dp_size,
-            shape_per_token_dict=shape_per_token_dict,
-            dtype_dict=dtype_dict,
-            block_size=block_size,
-            num_blocks=num_blocks,
-            device=device,
-        )
-
-    @staticmethod
-    def _init_multimodal_cache_manager(
-        args,
-        base_cache_manager,
-    ):
-        """Create a dedicated PagedKVCacheManager for Qwen3-VL/Qwen3.5 multimodal features.
-
-        This cache holds vision embeddings, DeepStack features between the
-        vision-encoder run and their chunked-prefill consumption by the LLM.
-        It is separate from the main KV cache so vision tensors never occupy
-        transformer KV blocks.
-
-        Args:
-            args: Global configuration.
-            base_cache_manager: The already-initialised main KV cache manager.
-                Used to copy block_size / num_hot_req so both caches are aligned.
-
-        Returns:
-            An MMPagedKVCacheManager instance, or None for non-Qwen3-VL models.
-        """
-        if args.models.type not in {
-            ModelType.HF_QWEN3_VL,
-            ModelType.HF_QWEN3_VL_MOE,
-            ModelType.HF_QWEN3_5,
-        }:
-            return None
-
-        vision_cfg = getattr(args.models, "vision_config", None)
-        if vision_cfg is None:
-            logger.warning(
-                "Qwen3-VL or Qwen-3.5 detected but args.models.vision_config is missing; "
-                "skipping multimodal cache manager."
-            )
-            return None
-
-        hidden_size = int(getattr(vision_cfg, "out_hidden_size", 4096))
-        deepstack_indexes = list(getattr(vision_cfg, "deepstack_visual_indexes", []))
-        num_ds_layers = len(deepstack_indexes)
-        max_vision_token = getattr(vision_cfg, "max_vision_tokens", 16384)
-
-        shape_per_token_dict = {"vision_embeds": (hidden_size,)}
-        if num_ds_layers > 0:
-            shape_per_token_dict["deepstack_embeds"] = (num_ds_layers, hidden_size)
-
-        dtype = torch.bfloat16
-        dtype_dict = {k: dtype for k in shape_per_token_dict}
-
-        block_size = base_cache_manager.block_size
-        num_hot_req = base_cache_manager.num_hot_req
-        max_pict_token_num = min(
-            max_vision_token, args.infer.max_seq_len
-        )  # max_vision_token is computed according to preprocessor_config.json in model file.
-        auto_mm_blocks = ceil_div(max_pict_token_num, block_size) * num_hot_req
-        num_mm_blocks = (
-            args.infer.max_multimodal_blocks
-            if args.infer.max_multimodal_blocks not in (-1, 0)
-            else auto_mm_blocks
-        )
-
-        device = base_cache_manager.device
-
-        layer_id_map = GlobalLocalMap.from_range(0, 1)
-
-        logger.info(
-            f"Initializing MMPagedKVCacheManager: "
-            f"num_multimodal_blocks={num_mm_blocks}, block_size={block_size}, "
-            f"hidden_size={hidden_size}, num_deepstack_layers={num_ds_layers}, dtype={dtype}"
-        )
-
-        return MMPagedKVCacheManager(
-            layer_id_map,
-            max_seq_len=args.infer.max_seq_len,
-            num_hot_req=num_hot_req,
-            shape_per_token_dict=shape_per_token_dict,
-            dtype_dict=dtype_dict,
-            block_size=block_size,
-            num_blocks=num_mm_blocks,
-            device=device,
-            quant_type="None",
-        )
-
-    @staticmethod
-    def _get_kv_cache_params(args, attn_backend_type):
-        """
-        Calculate the KV cache parameters based on model type and configuration.
-
-        Arguments:
-            args: Configuration with model settings
-
-        Returns:
-            Dictionary of parameters for KV cache initialization
-        """
-        tensor_parallel_size = args.infer.tp_size
-
-        kv_cache_kvargs = {}
-        quant_cfg = getattr(args.models, "quant_config", None)
-
-        if args.models.type == ModelType.DEEPSEEK_V3:
-            ds_fp8_quant = (
-                hasattr(quant_cfg, "kv_cache")
-                and getattr(quant_cfg.kv_cache, "type", None) == "fp8_pertoken_dsa"
-            )
-            if args.infer.mla_absorb in ["absorb", "absorb-without-precomp"]:
-                # NpuAttnBackend 仅在 paged cache 下使用分离 KV cache，
-                # 因为 mla_decode_paged_kv 依赖分离的 kv_lora/k_pe
-                use_separated_kv_lora_k_pe = attn_backend_type in [
-                    FlashInferBackend,
-                    TritonAttnBackend,
-                ] or (
-                    attn_backend_type is NpuAttnBackend
-                    and args.infer.cache_type == "paged"
-                )
-                if use_separated_kv_lora_k_pe:
-                    kv_cache_kvargs["shape_per_token_dict"] = {
-                        "kv_lora": (args.models.kv_lora_rank,),
-                        "k_pe": (args.models.qk_rope_head_dim,),
-                    }
-                else:
-                    if ds_fp8_quant:
-                        kv_cache_kvargs["shape_per_token_dict"] = {
-                            "kv_lora_k_pe": (
-                                # args.models.kv_lora_rank + args.models.kv_lora_rank // 128 * 4 + args.models.qk_rope_head_dim * 2,
-                                656,
-                            )
-                        }
-                    else:
-                        kv_cache_kvargs["shape_per_token_dict"] = {
-                            "kv_lora_k_pe": (
-                                args.models.kv_lora_rank + args.models.qk_rope_head_dim,
-                            )
-                        }
-            elif args.infer.mla_absorb == "none":
-                assert (
-                    not ds_fp8_quant
-                ), "mla_absorb=none does not support fp8_pertoken_dsa kv quant"
-                n_local_heads = args.models.n_heads // tensor_parallel_size
-                k_head_dim = args.models.qk_nope_head_dim + args.models.qk_rope_head_dim
-                v_head_dim = args.models.v_head_dim
-                kv_cache_kvargs["shape_per_token_dict"] = {
-                    "k": (n_local_heads, k_head_dim),
-                    "v": (n_local_heads, v_head_dim),
-                }
-            else:
-                raise NotImplementedError(
-                    f"Unsupported mla_absorb {args.infer.mla_absorb}"
-                )
-        else:
-            n_kv_heads = (
-                args.models.n_kv_heads
-                if hasattr(args.models, "n_kv_heads")
-                else args.models.n_heads
-            )
-            n_local_kv_heads = (
-                n_kv_heads // tensor_parallel_size
-                if n_kv_heads > tensor_parallel_size
-                else 1
-            )  # Compatible with tp_size>n_kv_heads
-            head_dim = (
-                args.models.head_dim
-                if hasattr(args.models, "head_dim")
-                else args.models.dim // args.models.n_heads
-            )
-            kv_cache_kvargs["n_local_kv_heads"] = n_local_kv_heads
-            kv_cache_kvargs["head_dim"] = head_dim
-
-        # kv cache dtype/quant config
-        kv_keys = (
-            list(kv_cache_kvargs["shape_per_token_dict"].keys())
-            if "shape_per_token_dict" in kv_cache_kvargs
-            else ["k", "v"]
-        )
-
-        kv_cache_cfg = (
-            getattr(quant_cfg, "kv_cache", None) if quant_cfg is not None else None
-        )
-        quant_type = (
-            getattr(kv_cache_cfg, "type", None) if kv_cache_cfg is not None else None
-        )
-
-        if kv_cache_cfg is None or quant_type is None:
-            return kv_cache_kvargs
-
-        kv_cache_rules = getattr(kv_cache_cfg, "rules", None) or []
-
-        # map kv_cache quant type to torch dtype
-        quant_type_to_dtype = {
-            "fp8_pertensor": torch.float8_e4m3fn,
-            "fp8_pertoken_dsa": torch.float8_e4m3fn,  # special for DSV32
-        }
-
-        dtype_dict = {}
-
-        if kv_cache_rules:
-            for key in kv_keys:
-                matched = False
-                for rule in kv_cache_rules:
-                    pattern = getattr(rule, "regex", None)
-                    rtype = getattr(rule, "type", None) or quant_type
-                    if pattern and re.search(pattern, key):
-                        if rtype not in quant_type_to_dtype:
-                            raise NotImplementedError(
-                                f"Unsupported kv_cache quant type: {rtype}"
-                            )
-                        dtype_dict[key] = quant_type_to_dtype[rtype]
-                        matched = True
-                        break
-
-                if not matched:
-                    raise ValueError(
-                        f"kv_cache quant rules did not match key '{key}'. "
-                        f"Available keys: {kv_keys}. "
-                        f"Please add a rule for it."
-                    )
-        else:
-            if quant_type not in quant_type_to_dtype:
-                raise NotImplementedError(
-                    f"Unsupported kv_cache quant type: {quant_type}"
-                )
-            dtype = quant_type_to_dtype[quant_type]
-            dtype_dict = {k: dtype for k in kv_keys}
-
-        kv_cache_kvargs["dtype_dict"] = dtype_dict
-        kv_cache_kvargs["quant_type"] = quant_type
-        return kv_cache_kvargs
-
-    @staticmethod
-    def _get_linear_attn_cache_params(args):
-        tensor_parallel_size = args.infer.tp_size
-
-        n_v_heads = args.models.linear_n_v_heads
-        n_qk_heads = args.models.linear_n_qk_heads
-        head_dim = args.models.linear_head_dim
-        conv_kernel_size = args.models.linear_conv_kernel_dim
-
-        n_local_v_heads = n_v_heads // tensor_parallel_size
-        local_conv_dim = (n_qk_heads * 2 + n_v_heads) * head_dim // tensor_parallel_size
-
-        return {
-            "conv_state": (local_conv_dim, conv_kernel_size),
-            "recurrent_state": (n_local_v_heads, head_dim, head_dim),
-        }
-
-    # @staticmethod
-    # def _init_linear_attn_cache(args):
-    #     return Qwen3LinearAttnCacheManager()
-
-    @staticmethod
     def _get_attention_backend_type(args):
         if args.infer.attn_type == "auto":
+            # TODO auto use hunyuan attn
             if is_ascend():
                 return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
-            elif args.models.type == ModelType.DEEPSEEK_V3:
+            elif should_use_hopper_mixed_backend(args):
+                return HopperMixedBackend
+            elif args.models.type in [ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5]:
                 return FlashMLABackend
             else:
                 return HybridAttnBackend
@@ -896,6 +499,8 @@ class Backend:
             return NpuAttnBackend
         elif args.infer.attn_type == "ref":
             return RefAttnBackend
+        elif args.infer.attn_type == "hopper_mixed":
+            return HopperMixedBackend
         else:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
 
@@ -904,12 +509,12 @@ class Backend:
         # Yes, use `type` instead of `isinstance` here, because `AttnBackend`s inherit each other
         if attn_backend_type is FlashInferBackend:
             max_num_blocks = 0
-            for mgr in Backend.cache_managers.values():
-                if not isinstance(mgr, PagedKVCacheManager):
+            for cache in Backend.cache_dict.values():
+                if not isinstance(cache, PagedKVCache):
                     raise NotImplementedError(
                         "`infer.attn_type=flash_infer` is only compatible with `infer.cache_type=paged`"
                     )
-                max_num_blocks = max(max_num_blocks, mgr.get_max_num_blocks())
+                max_num_blocks = max(max_num_blocks, cache.max_num_blocks)
             return attn_backend_type(max_num_blocks)
         else:
             return attn_backend_type()
@@ -1078,12 +683,16 @@ class Backend:
         Returns:
             Initialized model architecture
         """
-        if args.models.type in [ModelType.DEEPSEEK_V3, ModelType.HF_QWEN_3_MOE]:
+        if args.models.type in [
+            ModelType.DEEPSEEK_V3,
+            ModelType.KIMI_K2_5,
+            ModelType.HF_QWEN_3_MOE,
+        ]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
         return Backend.build_model(
             args.models,
-            Backend.cache_managers,
+            Backend.cache_dict,
             max_position_embeddings=args.infer.max_seq_len
             + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
             pipeline_parallel_size=args.infer.pp_size,
@@ -1185,6 +794,7 @@ class Backend:
                 ModelType.HF_GPT_OSS,
                 ModelType.HF_MIXTRAL,
                 ModelType.DEEPSEEK_V3,
+                ModelType.KIMI_K2_5,
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
@@ -1245,8 +855,13 @@ class Backend:
                     and f"model.layers.{args.models.n_layers}" in k
                 ):
                     return False
-                if args.models.type == ModelType.HF_QWEN3_NEXT and "mtp." in k:
+                if (
+                    args.models.type in [ModelType.HF_QWEN3_NEXT, ModelType.HF_QWEN3_5]
+                    and "mtp." in k
+                ):
                     return False
+            if args.infer.language_model_only and k.startswith("model.visual"):
+                return False
             if args.models.quant_config.type == "blockfp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
             ):
@@ -1283,6 +898,7 @@ class Backend:
             checkpoint_prefix: str,
             model_prefix: str,
             local_layer_prefix: str | None = None,
+            extra_prefix_dict: dict[str, str] = None,
         ):
             """
             Example layer prefixes:
@@ -1299,6 +915,11 @@ class Backend:
                     skip_preprocess=args.skip_preprocess,
                     key_filter=key_filter,
                     prefix=checkpoint_prefix,
+                    prefix_list=(
+                        list(extra_prefix_dict.keys())
+                        if extra_prefix_dict is not None
+                        else None
+                    ),
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -1317,6 +938,14 @@ class Backend:
                         )
                     ] = v
                 state_dict = mapped
+
+                if extra_prefix_dict is not None:
+                    for k in list(state_dict.keys()):
+                        v = state_dict.pop(k)
+                        new_k = k
+                        for prefix_, replacement_ in extra_prefix_dict.items():
+                            new_k = new_k.replace(prefix_, replacement_)
+                        state_dict[new_k] = v
 
             target_prefix = local_layer_prefix or model_prefix
             try:
@@ -1338,8 +967,16 @@ class Backend:
 
         # Load transformer layers
         is_print_rank = int(os.environ.get("LOCAL_RANK", 0)) == 0
+        is_qwen3_5_mtp = (
+            args.models.type == ModelType.HF_QWEN3_5 and args.infer.mtp_size > 1
+        )
+        local_main_end_layer_id = (
+            model.local_end_layer_id
+            if not is_qwen3_5_mtp
+            else model.local_end_layer_id - 1
+        )
         for global_layer_id in tqdm(
-            range(model.local_begin_layer_id, model.local_end_layer_id),
+            range(model.local_begin_layer_id, local_main_end_layer_id),
             disable=not is_print_rank,
             desc="Model loading",
             unit="layer",
@@ -1358,6 +995,27 @@ class Backend:
                 local_layer_prefix=local_layer_prefix,
             )
 
+        if is_qwen3_5_mtp:
+            for global_layer_id in tqdm(
+                range(local_main_end_layer_id, model.local_end_layer_id),
+                disable=not is_print_rank,
+                desc="Model loading",
+                unit="layer",
+                leave=False,
+            ):
+                checkpoint_prefix, model_prefix, extra_prefix_dict = (
+                    model._get_layer_mtp_prefix_mapping(global_layer_id)
+                )
+                local_layer_id = global_layer_id - model.local_begin_layer_id
+
+                layer_prefix = f"layers.{global_layer_id}."
+                local_layer_prefix = f"layers.{local_layer_id}."
+                _load_and_apply(
+                    checkpoint_prefix,
+                    model_prefix,
+                    local_layer_prefix=local_layer_prefix,
+                    extra_prefix_dict=extra_prefix_dict,
+                )
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -1392,11 +1050,12 @@ class Backend:
         """
         # Initialize distributed environment
         Backend._init_distributed(args)
+        register_all_providers()
 
         # Dense KVCache and PP related
         if args.infer.cache_type == "skew":
             max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
-                args.infer.max_reqs, args.infer.dp_size
+                args.infer.max_batch_size, args.infer.dp_size
             )[get_dp_group().rank_in_group]
             set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 
@@ -1409,9 +1068,6 @@ class Backend:
         Backend.tokenizer = Backend._init_tokenizer(args)
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
-        Backend.constraint_decode_manager = ConstraintDecodeManager(
-            Backend.tokenizer.model, args.models.vocab_size
-        )
 
         # Initialize tool parser
         tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
@@ -1423,66 +1079,11 @@ class Backend:
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 
-        # Initialize cache manager
-        if (
-            args.models.type == ModelType.HF_QWEN3_NEXT
-            or args.models.type == ModelType.HF_QWEN3_5
-        ):
-
-            def is_full_attention(layer_id):
-                return (layer_id + 1) % args.models.full_attention_interval == 0
-
-            def filter_full_attn_layer(layers: Iterable[int]):
-                return [idx for idx in layers if is_full_attention(idx)]
-
-            def filter_linear_attn_layer(layers: Iterable[int]):
-                return [idx for idx in layers if not is_full_attention(idx)]
-
-            num_full_attn_blocks = (
-                args.infer.num_blocks
-                if args.models.num_full_attention_blocks == -1
-                else args.models.num_full_attention_blocks
-            )
-            num_linear_attn_blocks = (
-                args.infer.num_blocks
-                if args.models.num_linear_attention_blocks == -1
-                else args.models.num_linear_attention_blocks
-            )
-
-            Backend.cache_type = args.infer.cache_type
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(
-                    args,
-                    attn_backend_type,
-                    layer_filter_fn=filter_full_attn_layer,
-                    num_blocks=num_full_attn_blocks,
-                ),
-                "linear": Backend._init_linear_attn_cache_manager(
-                    args,
-                    layer_filter_fn=filter_linear_attn_layer,
-                    num_blocks=num_linear_attn_blocks,
-                ),
-            }
-            mm_cache = Backend._init_multimodal_cache_manager(
-                args, Backend.cache_managers["main"]
-            )
-            if mm_cache is not None:
-                Backend.cache_managers["multimodal"] = mm_cache
-        elif getattr(args.models, "type", "") == "deepseek-v3" and getattr(
-            args.models, "index_head_dim", None
-        ):
-            Backend.cache_type = args.infer.cache_type
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(args, attn_backend_type),
-                "indexer": Backend._init_indexer_cache_manager(args),
-            }
-        else:
-            main_cache = Backend._init_cache_manager(args, attn_backend_type)
-            Backend.cache_managers = {"main": main_cache}
-            Backend.cache_type = args.infer.cache_type
-            mm_cache = Backend._init_multimodal_cache_manager(args, main_cache)
-            if mm_cache is not None:
-                Backend.cache_managers["multimodal"] = mm_cache
+        # Initialize cache managers
+        bundle = build_cache_managers(args, attn_backend_type)
+        Backend.cache_type = bundle.cache_type
+        Backend.cache_dict = bundle.cache_dict
+        Backend.cache_managers = bundle.cache_managers
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(attn_backend_type)
@@ -1508,6 +1109,7 @@ class Backend:
     @staticmethod
     def stop():
         setattr(Backend, "model", None)
+        Backend.cache_dict.clear()
         setattr(Backend, "cache_managers", None)
         gc.collect()
         torch.cuda.empty_cache()
@@ -1519,6 +1121,7 @@ def load_state_dict(
     skip_preprocess=False,
     key_filter: Callable[[str], bool] = None,
     prefix: str = "",
+    prefix_list: list[str] = None,
 ):
     if not skip_preprocess:
         path = os.path.join(hf_ckpt_path, "*.safetensors")
@@ -1538,6 +1141,12 @@ def load_state_dict(
                     state_dict[name] = param
                 else:
                     ignored_params.append(name)
+
+            if prefix_list is not None:
+                for name in f.keys():
+                    if name.startswith(tuple(prefix_list)):
+                        param: torch.Tensor = f.get_tensor(name)
+                        state_dict[name] = param
 
     if ignored_params:
         logger.info(

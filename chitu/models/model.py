@@ -19,11 +19,7 @@ from chitu.task_type import TaskType
 from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import (
-    KVCacheManagerBase,
-    PagedKVCacheManager,
-    DenseKVCacheManager,
-)
+from chitu.kv_cache import KVCacheBase, PagedKVCache, DenseKVCache
 from chitu.cuda_graph import (
     make_dispatched_graphed_callables,
     cuda_graph_safe_cached_property,
@@ -35,7 +31,8 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
 )
-from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate
+from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate, add_shared_experts
+from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_tp_size,
@@ -46,6 +43,8 @@ from chitu.distributed.parallel_state import (
     get_dp_size,
     get_pp_group,
     get_pp_size,
+    get_embed_tokens_lm_head_tp_group,
+    get_embed_tokens_lm_head_tp_size,
 )
 from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.moe import get_moe_impl, MoEImplBase
@@ -68,7 +67,6 @@ from chitu.quantization import (
 from chitu.hybrid_device import CPUParameter
 from chitu.static_tensor import StaticTensor
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
@@ -170,7 +168,7 @@ class RMSNormBias(RMSNorm):
 
 
 class Attention(nn.Module):
-    def __init__(self, layer_id, cache: KVCacheManagerBase, attn_backend):
+    def __init__(self, layer_id, cache: KVCacheBase, attn_backend):
         super().__init__()
         self.layer_id = layer_id
         self.cache = cache
@@ -206,7 +204,7 @@ class TransformerBlock(nn.Module):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
     ):
@@ -225,7 +223,7 @@ class Transformer(nn.Module):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -235,7 +233,7 @@ class Transformer(nn.Module):
         **kvargs,
     ):
         super().__init__()
-        self.cache_managers = cache_managers
+        self.cache_dict = cache_dict
         self.attn_backend = attn_backend
         self.op_impl = op_impl
         self.rank = torch.distributed.get_rank()
@@ -254,6 +252,10 @@ class Transformer(nn.Module):
         self.dp_size = get_dp_size()
         self.ep_group = get_ep_group()
         self.ep_size = self.ep_group.group_size
+        self.embed_tokens_lm_head_tp_size = get_embed_tokens_lm_head_tp_size()
+        self.embed_tokens_lm_head_tp_rank = (
+            get_embed_tokens_lm_head_tp_group().rank_in_group
+        )
         self.pp_stage = get_pp_group().rank_in_group
         self.pp_main_rank = (self.rank // tensor_parallel_size) * tensor_parallel_size
         self.pp_end_stage = get_pp_size() - 1
@@ -264,6 +266,9 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.global_n_layers = params.n_layers + (1 if self.mtp_size > 1 else 0)
+        self.max_batch_size_per_dp = ceil_div(
+            int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
+        )
         if self.pipeline_exec:
             num_layers_of_each_rank = compute_layer_dist_in_pp(
                 self.global_n_layers, self.pipeline_parallel_size
@@ -279,7 +284,7 @@ class Transformer(nn.Module):
 
         if not self.pipeline_exec or self.pp_stage == 0:
             self._init_pre_layers()
-        self._init_layers(cache_managers, attn_backend=attn_backend, op_impl=op_impl)
+        self._init_layers(cache_dict, attn_backend=attn_backend, op_impl=op_impl)
         if not self.pipeline_exec or self.pp_stage == self.pipeline_parallel_size - 1:
             self._init_post_layers()
 
@@ -289,9 +294,11 @@ class Transformer(nn.Module):
 
         self.do_decode_callable = None
         self.args = get_global_args()
-        self.max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
         self.model_type = self.args.models.type
         self.use_cuda_graph = self.args.infer.use_cuda_graph
+        self.specialize_embed_tokens_lm_head_parallel = (
+            self.tp_size == 1 and self.embed_tokens_lm_head_tp_size > 1
+        )
 
         self.moe_impl = get_moe_impl()
 
@@ -320,6 +327,14 @@ class Transformer(nn.Module):
             device=self.device,
         )
 
+        if self.specialize_embed_tokens_lm_head_parallel:
+            dummy_embed_tokens_input_shape = [0, 1]
+            self.dummy_embed_tokens_input = torch.empty(
+                dummy_embed_tokens_input_shape,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
         self.graph_dummy_output = torch.empty(
             [1],
             dtype=torch.get_default_dtype(),
@@ -347,6 +362,9 @@ class Transformer(nn.Module):
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
         raise NotImplementedError
 
+    def _get_layer_mtp_prefix_mapping(self, i: int) -> tuple[str, str, dict[str, str]]:
+        raise NotImplementedError
+
     def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
@@ -363,6 +381,8 @@ class Transformer(nn.Module):
             ret += ["fp_weight"]
         elif quant == "ascend_w8a8_dynamic":
             ret += ["weight_scale", "weight_offset"]
+        elif quant == "blockint4":
+            ret += ["qweight", "scales"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> list[str]:
@@ -589,6 +609,22 @@ class Transformer(nn.Module):
             else:
                 partial_checkpoint[name] = param
 
+        return partial_checkpoint
+
+    def _chunk_checkpoint_for_specialize_embed_tokens_lm_head_parallel(
+        self,
+        checkpoint: dict[str, Any],
+        rank: int,
+        dp_size: int,
+    ):
+        partial_checkpoint = {}
+        cpl_names = ["embed_tokens", "lm_head", "shared_head.head.weight"]
+        for name, param in checkpoint.items():
+            if any(is_layer(s, name) for s in cpl_names):
+                chunks = torch.chunk(param, dp_size, dim=0)
+                partial_checkpoint[name] = chunks[rank]
+            else:
+                partial_checkpoint[name] = param
         return partial_checkpoint
 
     def process_state_dict_for_blockfp4_before_chunk(self, state_dict: dict[str, Any]):
@@ -938,6 +974,14 @@ class Transformer(nn.Module):
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
+            if self.specialize_embed_tokens_lm_head_parallel:
+                state_dict = (
+                    self._chunk_checkpoint_for_specialize_embed_tokens_lm_head_parallel(
+                        state_dict,
+                        self.rank % self.embed_tokens_lm_head_tp_size,
+                        self.embed_tokens_lm_head_tp_size,
+                    )
+                )
 
         return self.preprocess_state_dict(state_dict, skip_preprocess=skip_preprocess)
 
@@ -1005,9 +1049,7 @@ class Transformer(nn.Module):
     def _init_pre_layers(self):
         raise NotImplementedError
 
-    def _init_layers(
-        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
-    ):
+    def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
         raise NotImplementedError
 
     def _init_post_layers(self):
@@ -1051,30 +1093,67 @@ class Transformer(nn.Module):
     def prepare_freqs_cis(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.freqs_cis_real[
-                self.cache_managers[
-                    "main"
-                ].seq_len_delta.delta_position_ids_tensor_device
+                self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             ],
             self.freqs_cis_imag[
-                self.cache_managers[
-                    "main"
-                ].seq_len_delta.delta_position_ids_tensor_device
+                self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             ],
         )
 
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.freqs_cis_real[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
             self.freqs_cis_imag[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
         )
+
+    def prepare_global_num_tokens(self, tasks, comm_group: CommGroup):
+        device = torch.cuda.current_device()
+
+        if tasks.task_type == TaskType.Prefill:
+            # prepare prefill embed_tokens num_tokens (by num_tokens)
+            embed_num_tokens = tasks.num_tokens
+            embed_num_tokens_tensor = torch.tensor(
+                embed_num_tokens, dtype=torch.int32, device=device
+            )
+            self.global_embed_num_tokens = torch.zeros(
+                [comm_group.group_size + 1], dtype=torch.int32, device=device
+            )
+            comm_group.all_gather_into_tensor(
+                self.global_embed_num_tokens[1:], embed_num_tokens_tensor
+            )
+
+            self.embed_tokens_cum_num_tokens = (
+                torch.cumsum(self.global_embed_num_tokens, dim=0).cpu().tolist()
+            )
+
+            # prepare prefill lm_head num_tokens (by max(num_tasks))
+            lm_head_num_tokens = tasks.num_tasks
+            lm_head_num_tokens_tensor = torch.tensor(
+                lm_head_num_tokens, dtype=torch.int32, device=device
+            )
+            self.global_lm_head_num_tokens = torch.zeros(
+                [comm_group.group_size + 1], dtype=torch.int32, device=device
+            )
+            comm_group.all_gather_into_tensor(
+                self.global_lm_head_num_tokens[1:], lm_head_num_tokens_tensor
+            )
+
+            self.lm_head_cum_num_tokens = (
+                torch.cumsum(self.global_lm_head_num_tokens, dim=0).cpu().tolist()
+            )
+
+        # prepare decode embed_tokens num_tokens (by max_batch_size_per_dp * mtp_size), nothing to do here
+        if tasks.task_type == TaskType.Decode:
+            self.global_embed_num_tokens = self.global_lm_head_num_tokens = None
+            self.embed_tokens_cum_num_tokens = self.lm_head_cum_num_tokens = None
 
     @cuda_graph_safe_cached_property(
         "main_last_hidden_states_static", "main_last_hidden_states_up_to_date"
@@ -1091,7 +1170,7 @@ class Transformer(nn.Module):
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
         if self.mtp_size > 1:
-            for mgr in self.cache_managers.values():
+            for mgr in self.cache_dict.values():
                 mgr.seq_len_delta.is_decode_stage = False
             self.token_offset_list = None
             self.mtp_token_list = None
@@ -1100,7 +1179,7 @@ class Transformer(nn.Module):
             prefill_previous_hidden_states = self._get_prefill_previous_hidden_states(h)
             h_mtp = self._pre_layers_mtp(tokens, **args)
             h_mtp[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
                 == 0
@@ -1160,26 +1239,26 @@ class Transformer(nn.Module):
         token_list = []
         token_list.append(tokens)
         for i in range(0, self.mtp_size):
-            for mgr in self.cache_managers.values():
-                mgr.prepare_mtp_cache_decode(i)
-                if isinstance(mgr, PagedKVCacheManager):
-                    mgr.update_page_offs()
+            for cache in self.cache_dict.values():
+                cache.prepare_mtp_cache_decode(i)
+                if isinstance(cache, PagedKVCache):
+                    cache.update_page_offs()
             self.prepare_decoding_attn_mtp()
             h = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
             tokens = torch.argmax(h, dim=-1)
             token_list.append(tokens)
-        for mgr in self.cache_managers.values():
-            if isinstance(mgr, PagedKVCacheManager):
-                mgr.update_page_offs()
+        for cache in self.cache_dict.values():
+            if isinstance(cache, PagedKVCache):
+                cache.update_page_offs()
         self.main_last_hidden_states_up_to_date = False
         tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
         if self.use_cuda_graph:
-            for mgr in self.cache_managers.values():
-                mgr.seq_len_delta.is_decode_stage = True
+            for cache in self.cache_dict.values():
+                cache.seq_len_delta.is_decode_stage = True
             self.prepare_decoding_attn()
         else:
             self.attn_backend.prepare_metadata_for_prefill(
-                self.cache_managers["main"].seq_len_delta
+                self.cache_dict["main"].seq_len_delta
             )
             if (
                 self.moe_impl is not None
@@ -1213,8 +1292,8 @@ class Transformer(nn.Module):
             for i in range(tokens_proposal.size(0))
         ]
 
-        for mgr in self.cache_managers.values():
-            mgr.update_mtp_cache_decode(token_offset)
+        for cache in self.cache_dict.values():
+            cache.update_mtp_cache_decode(token_offset)
         self.token_offset_list = token_offset
         self.mtp_token_list = tokens_proposal_accepted
         self.last_hidden_states_4_postprocess = mtp_selected
@@ -1246,7 +1325,6 @@ class Transformer(nn.Module):
             h = h[output_token_offsets]
             h = self._post_layers(h)
             h = h.float()
-
         return h
 
     @torch.inference_mode()
@@ -1260,30 +1338,72 @@ class Transformer(nn.Module):
         if self.pp_stage == self.pp_end_stage:
             h = self._post_layers(h)
             h = h.float()
-
         return h
 
     @torch.inference_mode()
     def empty_prefill(self) -> torch.Tensor:
+        if self.specialize_embed_tokens_lm_head_parallel:
+            self.embed_tokens(
+                self.dummy_embed_tokens_input,
+                self.global_embed_num_tokens,
+                self.embed_tokens_cum_num_tokens,
+            )
         if self.ep_size > 1:
             for it, layer in enumerate(self.layers):
-                if it < self.moe_impl.n_dense_layers:
+                if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
                 layer.mlp(self.dummy_input)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            if not getattr(self.params, "tie_word_embeddings", False):
+                self.lm_head(
+                    self.dummy_input,
+                    self.global_lm_head_num_tokens,
+                    self.lm_head_cum_num_tokens,
+                )
+            else:
+                self.embed_tokens.forward_as_lm_head(
+                    self.dummy_input,
+                    self.global_lm_head_num_tokens,
+                    self.lm_head_cum_num_tokens,
+                )
         return None
 
     @torch.inference_mode()
     def empty_decode(self):
-        layer_main = self.layers[0:-1] if self.mtp_size > 1 else self.layers
+        if self.specialize_embed_tokens_lm_head_parallel:
+            self.embed_tokens(
+                self.dummy_embed_tokens_input,
+                self.global_embed_num_tokens,
+                self.embed_tokens_cum_num_tokens,
+            )
+        has_mtp_layer = self.mtp_size > 1 and self.pp_stage == self.pp_end_stage
+        layer_main = self.layers[0:-1] if has_mtp_layer else self.layers
         for it, layer in enumerate(layer_main):
-            if it < self.moe_impl.n_dense_layers:
+            if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                 continue
             layer.mlp(self.dummy_input)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            if not getattr(self.params, "tie_word_embeddings", False):
+                self.lm_head(
+                    self.dummy_input,
+                    self.global_lm_head_num_tokens,
+                    self.lm_head_cum_num_tokens,
+                )
+            else:
+                self.embed_tokens.forward_as_lm_head(
+                    self.dummy_input,
+                    self.global_lm_head_num_tokens,
+                    self.lm_head_cum_num_tokens,
+                )
         return self.graph_dummy_output
 
     @torch.inference_mode()
     def empty_mtp_decode(self):
+        if self.specialize_embed_tokens_lm_head_parallel:
+            self._pre_layers_mtp(self.dummy_embed_tokens_input)
         self.layers[-1].mlp(self.dummy_input)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            self._post_layers_mtp(self.dummy_input)
         return self.graph_dummy_output
 
     @torch.inference_mode()
@@ -1307,7 +1427,7 @@ class Transformer(nn.Module):
             return self.empty_prefill()
 
         self.attn_backend.prepare_metadata_for_prefill(
-            self.cache_managers["main"].seq_len_delta
+            self.cache_dict["main"].seq_len_delta
         )
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens, output_token_offsets, **args)
@@ -1316,16 +1436,16 @@ class Transformer(nn.Module):
 
     def prepare_decoding_attn(self):
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache_managers["main"].seq_len_delta,
-            self.cache_managers["main"].get_gpu_block_table(),
-            self.cache_managers["main"].get_block_size(),
+            self.cache_dict["main"].seq_len_delta,
+            self.cache_dict["main"].get_gpu_block_table(),
+            self.cache_dict["main"].block_size,
         )
 
     def prepare_decoding_attn_mtp(self):
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache_managers["main"].mtp_seq_len_delta,
-            self.cache_managers["main"].get_gpu_block_table(),
-            self.cache_managers["main"].get_block_size(),
+            self.cache_dict["main"].mtp_seq_len_delta,
+            self.cache_dict["main"].get_gpu_block_table(),
+            self.cache_dict["main"].block_size,
         )
 
     def _decode_graph_extra_inputs(
@@ -1380,9 +1500,9 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
-        if isinstance(self.cache_managers["main"], DenseKVCacheManager):
-            key = (batch_size, self.cache_managers["main"].get_start_and_end_idx()[0])
-        elif isinstance(self.cache_managers["main"], PagedKVCacheManager):
+        if isinstance(self.cache_dict["main"], DenseKVCache):
+            key = (batch_size, self.cache_dict["main"].get_start_and_end_idx()[0])
+        elif isinstance(self.cache_dict["main"], PagedKVCache):
             key = (batch_size,)
         else:
             assert False
@@ -1419,13 +1539,13 @@ class Transformer(nn.Module):
             if is_ascend() and not (
                 infer_args.cache_type == "skew"
                 and NpuAttnBackend.should_use_attn_from_cinfer_ascendc(
-                    self.args.models.type, infer_args.max_reqs
+                    self.args.models.type, infer_args.max_batch_size
                 )
             ):
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
                         {
-                            "actual_seq_lengths_kv": self.cache_managers[
+                            "actual_seq_lengths_kv": self.cache_dict[
                                 "main"
                             ].seq_len_delta.new.lens_list
                         }
@@ -1584,7 +1704,7 @@ class MoeGate(nn.Module):
         if self._debug_force_moe_balance:
             self._debug_force_moe_balance_mask_cache = (
                 self._debug_gen_force_moe_balance_mask(
-                    ceil_div(get_global_args().infer.max_reqs, get_dp_size())
+                    ceil_div(get_global_args().infer.max_batch_size, get_dp_size())
                 )
             )
 
@@ -1645,28 +1765,9 @@ class MoeGate(nn.Module):
         indices = indices.to(torch.int32)
 
         if self.n_fused_shared_experts > 0:
-            indice_shape = indices.shape
-            final_indices = torch.empty(
-                (indice_shape[0], indice_shape[1] + 1),
-                dtype=indices.dtype,
-                device=indices.device,
+            weights, indices = add_shared_experts(
+                weights, indices, self.n_experts, self.n_fused_shared_experts
             )
-
-            final_weights = torch.empty(
-                (weights.shape[0], weights.shape[1] + 1),
-                dtype=weights.dtype,
-                device=weights.device,
-            )
-
-            chitu_backend.cuda_add_shared_experts(
-                final_weights,
-                final_indices,
-                weights,
-                indices,
-                self.n_experts,
-                self.n_fused_shared_experts,
-            )
-            weights, indices = final_weights, final_indices
 
         return weights, indices
 
@@ -1770,7 +1871,12 @@ class ParallelMoeBlock(nn.Module):
             rerouted_indices = indices
 
         routed_x = IndexedBatchedRoutedActivation(
-            x, rerouted_indices, expert_ids_are_local=self.moe_impl.ep_size == 1
+            x,
+            rerouted_indices,
+            expected_n_tokens_per_expert=ceil_div(
+                weights.numel(), self.experts.global_n_experts
+            ),
+            expert_ids_are_local=self.moe_impl.ep_size == 1,
         )
 
         shared_y = None

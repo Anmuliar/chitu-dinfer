@@ -4,7 +4,7 @@
 
 from chitu.ops.rotary import apply_rotary_pos_emb, apply_rotary_pos_emb_partial
 from chitu.ops.activation import silu_and_mul
-from chitu.ops.sampling import multinomial, apply_frequency_penalty, response_append
+from chitu.ops.sampling import multinomial, apply_frequency_penalty
 from chitu.ops.kv_cache import (
     append_to_paged_kv_cache,
     update_singleton_paged_kv_cache,
@@ -20,11 +20,13 @@ from chitu.ops.moe_gate import moe_gate
 from chitu.ops.moe_sum import (
     moe_sum_per_token,
     moe_sum_expert_block_permuted,
+    moe_sum_per_expert_dense,
     moe_sum_expert_concat_permuted,
 )
 from chitu.ops.linear_attn import (
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
+    recurrent_gated_delta_rule_all_state,
 )
 from chitu.ops.quant import (
     linear,
@@ -62,9 +64,13 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_per_expert_dense,
+    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform
 from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
 from chitu.ops.norm_gate import rms_norm_gate
 from chitu.ops.fused_g import fused_g
+from chitu.ops.add_shared_experts import add_shared_experts
+from chitu.ops.topk import topk_indices

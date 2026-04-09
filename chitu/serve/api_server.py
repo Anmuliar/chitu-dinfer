@@ -26,18 +26,25 @@ from chitu.backend import Backend
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
-from chitu.task import RouterRequest, Task, TaskPool, UserRequest
+from chitu.profiler import MemoryRecorder
+from chitu.task import RouterRequest, Task, TaskPool, UserRequest, SampleParams
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import (
+    get_profile_output_root,
+    queue_mem_dump,
+    queue_profile_start,
+    queue_profile_stop,
     set_min_batch_size,
     get_priority_from_api_key,
+    parse_api_key_from_headers,
     submit_request,
     build_chat_template_kwargs,
 )
 from chitu.serve.router import start_dp_components
 from chitu.tool_call import ToolChoice, ChoiceToolCall, adjust_message_for_tool_calls
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
+from chitu.serve.responses_api import create_router as create_responses_router
 
 logger = getLogger(__name__)
 
@@ -48,8 +55,39 @@ rank = 0
 # DP related globals
 dp_service_started = False
 
+# Reference to the uvicorn server instance for graceful shutdown
+_uvicorn_server: Optional["uvicorn.Server"] = None
+
 # Create FastAPI app
 app = FastAPI()  # Unified API
+
+# Inference endpoint prefixes that are subject to overload rejection
+_INFERENCE_PATH_PREFIXES = (
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/messages",
+    "/v1/responses",
+)
+
+
+@app.middleware("http")
+async def reject_overload(request: Request, call_next):
+    if request.url.path.startswith(_INFERENCE_PATH_PREFIXES):
+        args = get_global_args()
+        max_total = getattr(args.infer, "max_concurrent_requests", None)
+        if max_total is not None:
+            current = len(TaskPool.pool) + len(TaskPool.pending_queue)
+            if current >= max_total:
+                logger.warning(
+                    f"Overloaded: {current} requests in flight (limit {max_total}), rejecting"
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {"message": "Server overloaded", "type": "overloaded"}
+                    },
+                )
+    return await call_next(request)
 
 
 class Message(BaseModel):
@@ -143,6 +181,17 @@ class DetokenizeRequest(BaseModel):
     tokens: list[int]
 
 
+class ProfileRequest(BaseModel):
+    output_dir: str = "trace/chitu"
+    activities: Optional[list[str]] = None
+    start_step: int = Field(default=0, ge=0)
+    num_steps: int = Field(default=10, ge=1)
+    with_stack: bool = False
+    profile_by_stage: bool = False
+    profile_memory: bool = False
+    memory_max_entries: int = Field(default=100000, ge=1)
+
+
 def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
     # enable_thinking / max_new_tokens / chat_template_kwargs
     args = get_global_args()
@@ -183,6 +232,13 @@ app.include_router(
         priority_for_api_key=get_priority_from_api_key,
     )
 )
+app.include_router(
+    create_responses_router(
+        get_server_status=lambda: server_status,
+        get_dp_service_started=lambda: dp_service_started,
+        priority_for_api_key=get_priority_from_api_key,
+    )
+)
 
 # ====== Standard HTTP Endpoints ======
 
@@ -215,14 +271,7 @@ async def create_chat_completion(
 
         args = get_global_args()
 
-        api_key = ""
-        if authorization is not None:
-            if not authorization.startswith("Bearer "):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Authorization header must start with 'Bearer'",
-                )
-            api_key = authorization[len("Bearer ") :]
+        api_key = parse_api_key_from_headers(authorization)
         task_priority = get_priority_from_api_key(api_key)
 
         # Parse JSON body tolerant to missing/incorrect content-type
@@ -291,15 +340,42 @@ async def init_chitu_service():
     return {"message": "Service initial done."}
 
 
-@app.post("/stop")
-async def stop_chitu_service():
-    global server_status
-    if server_status:
-        Backend.stop()
-        server_status = False
-        return {"message": "Service has been terminated."}
-    else:
-        return {"message": "Service has not been initialized."}
+class TerminateRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/terminate_engine")
+async def terminate_engine(request: TerminateRequest):
+    global server_status, _uvicorn_server
+    if not server_status:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Service has not been initialized."},
+        )
+    if not request.confirm:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": 'Termination not confirmed. Send {"confirm": true} to proceed.'
+            },
+        )
+
+    logger.info(
+        "[terminate_engine] Termination requested, draining in-flight requests..."
+    )
+    server_status = False
+
+    # Set Terminating (not Terminated) so the worker thread finishes
+    # in-flight requests before broadcasting TerminateBackend.
+    from chitu.backend import Backend, BackendState
+
+    Backend.state = BackendState.Terminating
+
+    # Signal uvicorn to shut down gracefully
+    if _uvicorn_server is not None:
+        _uvicorn_server.should_exit = True
+
+    return {"message": "Terminate signal sent. Engine and server are shutting down."}
 
 
 @app.post("/status")
@@ -318,7 +394,8 @@ async def get_chitu_load_status():
     return {
         "load_score": f"{load_score}",
         "handle_reqs": f"{handle_reqs}",
-        "max_reqs": f"{args.infer.max_reqs}",
+        "max_batch_size": f"{args.infer.max_batch_size}",
+        "max_concurrent_requests": f"{getattr(args.infer, 'max_concurrent_requests', '')}",
     }
 
 
@@ -330,6 +407,72 @@ async def get_chitu_ping():
 @app.post("/health")
 async def health():
     pass  # TODO Check the inference service
+
+
+@app.post("/profile/start")
+async def start_profile(request: ProfileRequest):
+    try:
+        output_dir = queue_profile_start(
+            output_dir=request.output_dir,
+            activities=request.activities,
+            start_step=request.start_step,
+            num_steps=request.num_steps,
+            with_stack=request.with_stack,
+            profile_by_stage=request.profile_by_stage,
+            profile_memory=request.profile_memory,
+            memory_max_entries=request.memory_max_entries,
+        )
+    except Exception as e:
+        logger.exception("Failed to queue profiler start request")
+        raise HTTPException(status_code=500, detail=f"Failed to start profiler: {e}")
+
+    return {
+        "message": "Profiler start queued",
+        "output_dir": output_dir,
+        "requested_output_dir": request.output_dir,
+        "resolved_output_dir": output_dir,
+        "runtime_cwd": os.getcwd(),
+        "output_root": get_profile_output_root(),
+        "activities": request.activities,
+        "start_step": request.start_step,
+        "num_steps": request.num_steps,
+        "with_stack": request.with_stack,
+        "profile_by_stage": request.profile_by_stage,
+        "memory_max_entries": request.memory_max_entries,
+    }
+
+
+@app.post("/profile/stop")
+async def stop_profile():
+    try:
+        queue_profile_stop()
+    except Exception as e:
+        logger.exception("Failed to queue profiler stop request")
+        raise HTTPException(status_code=500, detail=f"Failed to stop profiler: {e}")
+
+    return {
+        "message": "Profiler stop queued",
+        "runtime_cwd": os.getcwd(),
+    }
+
+
+@app.post("/profile/dump_memory")
+async def dump_memory():
+    """Queue a dump_memory command for all ranks."""
+    rec = MemoryRecorder.get()
+    if not rec.enabled and not rec.recording:
+        raise HTTPException(
+            status_code=400,
+            detail="Memory recording is not active "
+            "(set CHITU_MEM_TRACK=1 or start a MEM profile)",
+        )
+
+    queue_mem_dump()
+
+    return {
+        "message": "dump_memory command queued (rank 0 applies immediately, "
+        "others receive via ZMQ during next inference step)",
+    }
 
 
 @app.post("/tokenize")
@@ -783,7 +926,9 @@ async def start_uvicorn_async(args):
         timeout_keep_alive=keepalive,
         access_log=True,
     )
+    global _uvicorn_server
     server = uvicorn.Server(config)
+    _uvicorn_server = server
     # Run server in current event loop - use await instead of asyncio.run!
     await server.serve()
 

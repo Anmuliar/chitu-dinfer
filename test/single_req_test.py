@@ -2,6 +2,7 @@ import hydra
 import torch
 import time
 import os
+import sys
 import random
 import logging
 from logging import getLogger
@@ -163,7 +164,10 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
 
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     global local_args, msgs
-    if "DeepSeek-V3.2" in local_args.models.name:
+    if (
+        "DeepSeek-V3.2" in local_args.models.name
+        and local_args.infer.max_seq_len >= 4096
+    ):
         msgs = msgs_long + msgs
 
     if local_args.request.prompt_tokens_len > 0:
@@ -185,7 +189,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
         chitu_start()
         if rank == 0:
             reqs = gen_reqs(
-                num_reqs=args.infer.max_reqs,
+                num_reqs=args.infer.max_batch_size,
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
                 is_vl=hasattr(args.models, "vision_config")
@@ -214,8 +218,14 @@ def run_pipe_or_tensor_parallelism(args, timers):
             )
 
             for i, req in enumerate(reqs):
+                if sys.stdout.isatty():
+                    GRAY = "\033[1;30m"
+                    RESET = "\033[0m"
+                else:
+                    GRAY = ""
+                    RESET = ""
                 logger.info(
-                    f"Response in rank {rank}: reqs[{i}].output={req.output},reqs[{i}].input={req.message}"
+                    f"Response in rank {rank}: reqs[{i}].output={req.output}, {GRAY}reqs[{i}].input={req.message}{RESET}"
                 )
 
             timers.log()
@@ -228,7 +238,7 @@ def run_normal(args, timers):
 
     for i in range(2):
         reqs = gen_reqs(
-            num_reqs=args.infer.max_reqs,
+            num_reqs=args.infer.max_batch_size,
             max_new_tokens=args.request.max_new_tokens,
             frequency_penalty=args.request.frequency_penalty,
             is_vl=hasattr(args.models, "vision_config")

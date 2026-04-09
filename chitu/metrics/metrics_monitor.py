@@ -12,6 +12,7 @@ from chitu.metrics import PrometheusServerManager
 from chitu.metrics.grafana_manager import GrafanaManager
 from chitu.global_vars import get_global_args
 from chitu.metrics.task_stats import count_tasks
+from chitu.metrics.cache_stats import paged_kvcache_stats
 from chitu.utils import ceil_div
 
 try:
@@ -67,14 +68,20 @@ class MetricsMonitor:
 
         self._stop_event.set()
         if self._thread:
-            self._thread.join()
+            self._thread.join(timeout=float(self.log_interval) + 1.0)
+            if self._thread.is_alive():
+                logger.warning(
+                    "Metrics monitor thread did not exit in time; continue shutdown."
+                )
         self._started = False
         logger.info("Metrics monitor stopped")
 
     def _monitor_loop(self):
         """Main monitoring loop that runs in the background thread."""
         while not self._stop_event.is_set():
-            time.sleep(self.log_interval)
+            self._stop_event.wait(self.log_interval)
+            if self._stop_event.is_set():
+                break
             try:
                 if (
                     hasattr(self.manager, "is_running")
@@ -104,22 +111,31 @@ class MetricsMonitor:
                 total_blocks = self.manager.query_metric_latest_value_each_rank(
                     "chitu_total_blocks"
                 )
-                total_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_total_bytes"
+                cuda_total_bytes = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_cuda_total_bytes"
                 )
-                used_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_used_bytes"
+                cuda_used_bytes = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_cuda_used_bytes"
                 )
                 torch_allocated_bytes = (
                     self.manager.query_metric_latest_value_each_rank(
                         "chitu_torch_allocated_bytes"
                     )
                 )
+                torch_reserved_bytes = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_torch_reserved_bytes"
+                )
                 mtp_proposed_rate = self.manager.query_metric_rate_each_rank(
                     "chitu_mtp_proposed_tokens_total", time_window=log_interval
                 )
                 mtp_accepted_rate = self.manager.query_metric_rate_each_rank(
                     "chitu_mtp_accepted_tokens_total", time_window=log_interval
+                )
+                total_hit_tokens = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_total_hit_tokens_total"
+                )
+                total_prompt_tokens = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_total_prompt_tokens_total"
                 )
                 self._print_stats(
                     prompt_tps,
@@ -128,9 +144,12 @@ class MetricsMonitor:
                     kvcache_usage,
                     used_blocks,
                     total_blocks,
-                    total_bytes,
-                    used_bytes,
+                    cuda_total_bytes,
+                    cuda_used_bytes,
                     torch_allocated_bytes,
+                    torch_reserved_bytes,
+                    total_hit_tokens,
+                    total_prompt_tokens,
                     mtp_proposed_rate,
                     mtp_accepted_rate,
                 )
@@ -145,9 +164,12 @@ class MetricsMonitor:
         kvcache_usage: dict[tuple[str, str], str],
         used_blocks: dict[tuple[str, str], str],
         total_blocks: dict[tuple[str, str], str],
-        total_bytes: dict[tuple[str, str], str],
-        used_bytes: dict[tuple[str, str], str],
+        cuda_total_bytes: dict[tuple[str, str], str],
+        cuda_used_bytes: dict[tuple[str, str], str],
         torch_allocated_bytes: dict[tuple[str, str], str],
+        torch_reserved_bytes: dict[tuple[str, str], str],
+        total_hit_tokens: dict[tuple[str, str], str],
+        total_prompt_tokens: dict[tuple[str, str], str],
         mtp_proposed_rate: dict[tuple[str, str], str] = None,
         mtp_accepted_rate: dict[tuple[str, str], str] = None,
     ):
@@ -158,9 +180,12 @@ class MetricsMonitor:
             kvcache_usage,
             used_blocks,
             total_blocks,
-            total_bytes,
-            used_bytes,
+            cuda_total_bytes,
+            cuda_used_bytes,
             torch_allocated_bytes,
+            torch_reserved_bytes,
+            total_hit_tokens,
+            total_prompt_tokens,
         ]
         all_rank_dp_pairs = {
             key for metric_dict in all_metric_dict for key in metric_dict
@@ -175,8 +200,19 @@ class MetricsMonitor:
             prealloc_blocks = (
                 prealloc_blocks_by_dp.get(dp_id) if prealloc_blocks_by_dp else None
             )
+
+            hit_tokens = int(total_hit_tokens.get(rank_dp, "0"))
+            prompt_tokens = int(total_prompt_tokens.get(rank_dp, "0"))
+            hit_rate = hit_tokens / prompt_tokens if prompt_tokens != 0 else 0
+
             used_blocks_value = int(used_blocks.get(rank_dp, "0"))
             total_blocks_value = int(total_blocks.get(rank_dp, "0"))
+            kv_cache_usage = float(kvcache_usage.get(rank_dp, "0"))
+
+            if used_blocks_value == 0 or total_blocks_value == 0 or kv_cache_usage == 0:
+                used_blocks_value, total_blocks_value, kv_cache_usage = (
+                    paged_kvcache_stats(dp_id=dp_id)
+                )
 
             mtp_hit_rate = None
             if mtp_proposed_rate and mtp_accepted_rate:
@@ -195,9 +231,13 @@ class MetricsMonitor:
                 used_blocks=used_blocks_value,
                 total_blocks=total_blocks_value,
                 prealloc_blocks=prealloc_blocks,
-                total_bytes=float(total_bytes.get(rank_dp, "0")),
-                used_bytes=float(used_bytes.get(rank_dp, "0")),
+                cuda_total_bytes=float(cuda_total_bytes.get(rank_dp, "0")),
+                cuda_used_bytes=float(cuda_used_bytes.get(rank_dp, "0")),
                 torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "0")),
+                torch_reserved_bytes=float(torch_reserved_bytes.get(rank_dp, "0")),
+                hit_len=hit_tokens,
+                prompt_tokens=prompt_tokens,
+                hit_rate=hit_rate,
                 mtp_hit_rate=mtp_hit_rate,
             )
             logger.info(f"[rank{rank}, DP{dp_id}]: {log_msg}")
@@ -213,9 +253,13 @@ class MetricsMonitor:
         used_blocks,
         total_blocks,
         prealloc_blocks,
-        total_bytes,
-        used_bytes,
+        cuda_total_bytes,
+        cuda_used_bytes,
         torch_allocated_bytes,
+        torch_reserved_bytes,
+        hit_len,
+        prompt_tokens,
+        hit_rate,
         mtp_hit_rate=None,
     ):
         """Build metrics statistics message."""
@@ -225,22 +269,28 @@ class MetricsMonitor:
             f"Running: {running} reqs",
             f"Waiting: {waiting} reqs",
             f"KV cache usage: {kv_cache_usage*100:.1f}%({used_blocks}/{total_blocks})",
+            f"Hit rate: {hit_rate*100:.1f}%({hit_len}/{prompt_tokens})",
             f"Task evictions: {eviction_rate:.2f}/s",
         ]
         if mtp_hit_rate is not None:
             parts.append(f"MTP hit rate: {mtp_hit_rate*100:.1f}%")
         prealloc_msg = str(int(prealloc_blocks)) if prealloc_blocks is not None else "-"
         parts.append(f"KV blocks prealloc: {prealloc_msg}")
-        if total_bytes > 0 and used_bytes >= 0:
-            used_gib = used_bytes / 1024**3
-            total_gib = total_bytes / 1024**3
+        if cuda_total_bytes > 0 and cuda_used_bytes >= 0:
+            used_gib = cuda_used_bytes / 1024**3
+            total_gib = cuda_total_bytes / 1024**3
             if torch_allocated_bytes >= 0:
-                torch_gib = torch_allocated_bytes / 1024**3
-                non_torch_gib = max(used_bytes - torch_allocated_bytes, 0.0) / 1024**3
+                torch_allocated_gib = torch_allocated_bytes / 1024**3
+                torch_reserved_gib = torch_reserved_bytes / 1024**3
+                torch_unused_gib = torch_reserved_gib - torch_allocated_gib
+                non_torch_gib = (
+                    max(cuda_used_bytes - torch_reserved_bytes, 0.0) / 1024**3
+                )
                 parts.append(
                     "GPU mem: "
                     f"{used_gib:.2f}/{total_gib:.2f} GiB "
-                    f"(torch: {torch_gib:.2f} GiB, non-torch: {non_torch_gib:.2f} GiB)"
+                    f"(torch-allocated: {torch_allocated_gib:.2f} GiB, torch-unused: {torch_unused_gib:.2f} "
+                    f"GiB, non-torch: {non_torch_gib:.2f} GiB)"
                 )
             else:
                 parts.append(f"GPU mem: {used_gib:.2f}/{total_gib:.2f} GiB")
@@ -253,11 +303,11 @@ class MetricsMonitor:
         scheduler = get_pd_scheduler_instance()
         if scheduler is None:
             return None
-        if Backend.cache_managers["main"] is None:
+        if Backend.cache_dict["main"] is None:
             return None
-        if not hasattr(Backend.cache_managers["main"], "get_block_size"):
+        if not hasattr(Backend.cache_dict["main"], "block_size"):
             return None
-        block_size = Backend.cache_managers["main"].get_block_size()
+        block_size = Backend.cache_dict["main"].block_size
         if block_size <= 0:
             return None
         tokens_by_dp = getattr(

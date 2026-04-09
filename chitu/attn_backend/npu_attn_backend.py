@@ -11,7 +11,7 @@ import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import get_device_name
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
@@ -67,7 +67,7 @@ class NpuAttnBackend(RefAttnBackend):
         self.first_seq_id_per_core = StaticTensor(
             max_nelem=self.max_aiv_num + 1, dtype=torch.int32, device="npu"
         )
-        max_batch_size = self.args.infer.max_reqs
+        max_batch_size = self.args.infer.max_batch_size
         max_seq_len = self.args.infer.max_seq_len
         self.decode_casual_attn_mask = StaticTensor(
             max_nelem=max_batch_size * 8 * max_seq_len, dtype=torch.bool, device="npu"

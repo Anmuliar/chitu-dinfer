@@ -57,7 +57,7 @@ run_server(){
             models=LLaDA2.0-mini \
             models.ckpt_dir=/data/nfs/LLaDA2.1-mini \
             infer.use_cuda_graph=True \
-            infer.max_reqs=256 \
+            infer.max_batch_size=256 \
             infer.max_seq_len=2048 \
             request.max_new_tokens=1200
         "

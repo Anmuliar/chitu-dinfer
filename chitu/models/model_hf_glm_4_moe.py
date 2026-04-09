@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.models.model import RMSNorm, get_linear_layout_native_y
 from chitu.models.model_hf_llama import TransformerBlockHFLlama
 from chitu.models.model_hf_qwen2_vl import (
@@ -38,6 +38,8 @@ from chitu.muxi_utils import (
 )
 from chitu.tensor_parallel import ColumnParallelLinear, VocabParallelEmbedding
 from chitu.distributed.partition import compute_expert_dist_in_ep
+from chitu.utils import ceil_div
+from chitu.distributed.parallel_state import get_dp_size
 
 
 class Glm4vVisionEmbeddings(nn.Module):
@@ -292,7 +294,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         *,
         op_impl="torch",
@@ -326,7 +328,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -350,7 +352,7 @@ class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         *,
         op_impl="torch",
@@ -360,7 +362,7 @@ class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -369,8 +371,13 @@ class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
         self.enorm = RMSNorm(args.dim, eps=getattr(args, "rms_norm_eps", 1e-6))
         self.hnorm = RMSNorm(args.dim, eps=getattr(args, "rms_norm_eps", 1e-6))
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
-        self.shared_head = SharedHeadDeepSeekV3(args)
-        self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
+        self.max_batch_size_per_dp = ceil_div(
+            int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
+        )
+        self.shared_head = SharedHeadDeepSeekV3(args, self.max_batch_size_per_dp)
+        self.embed_tokens = VocabParallelEmbedding(
+            args.vocab_size, args.dim, decode_max_num_tokens=self.max_batch_size_per_dp
+        )
 
     @override
     def forward(
@@ -392,7 +399,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -410,7 +417,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -555,7 +562,12 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
 
     @override
     def _pre_layers_mtp(self, h, **args):
-        return self.layers[-1].embed_tokens(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            return self.layers[-1].embed_tokens(
+                h, self.global_embed_num_tokens, self.embed_tokens_cum_num_tokens
+            )
+        else:
+            return self.layers[-1].embed_tokens(h)
 
     @override
     def _get_prefill_previous_hidden_states(self, h):

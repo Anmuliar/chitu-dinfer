@@ -15,7 +15,7 @@ from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -38,6 +38,7 @@ from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    LmHeadColumnParallelLinear,
 )
 from chitu.distributed.parallel_state import get_tp_size
 
@@ -256,7 +257,7 @@ class AttentionHFLlama(Attention):
         xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
 
         # optional kvcache quant
-        # NOTE: if self.cache is instance of KVCacheManagerBase, no need to judge
+        # NOTE: if self.cache is instance of KVCacheBase, no need to judge
         if hasattr(self.cache, "is_quant_kv") and self.cache.is_quant_kv:
             xq, xk, xv, descales = self.cache.kvcache_quant(
                 q=xq,
@@ -383,7 +384,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -391,11 +392,11 @@ class TransformerBlockHFLlama(TransformerBlock):
         checkpoint_prefix="",
         attn_type=AttentionHFLlama,
     ):
-        super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
+        super().__init__(layer_id, args, cache_dict, attn_backend, op_impl)
         self.self_attn = attn_type(
             args,
             layer_id,
-            cache_managers["main"],
+            cache_dict["main"],
             attn_backend,
             rotary_type=rotary_type,
             op_impl=op_impl,
@@ -454,7 +455,7 @@ class TransformerHFLlama(Transformer):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -481,7 +482,7 @@ class TransformerHFLlama(Transformer):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -532,6 +533,9 @@ class TransformerHFLlama(Transformer):
             prefix_mappings.extend([("model.norm.", "norm.")])
             if not getattr(self.params, "tie_word_embeddings", False):
                 prefix_mappings.extend([("lm_head.", "lm_head.")])
+            else:
+                # Tied embeddings use embed_tokens as lm_head on the last PP stage.
+                prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
         return prefix_mappings
 
     @override
@@ -663,19 +667,19 @@ class TransformerHFLlama(Transformer):
 
     def _init_pre_layers(self):
         self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
+            num_embeddings=self.params.vocab_size,
+            embedding_dim=self.params.dim,
+            decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
         )
 
-    def _init_layers(
-        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
-    ):
+    def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
                 self.layer_type_callback(layer_id)(
                     layer_id,
                     self.params,
-                    cache_managers,
+                    cache_dict,
                     attn_backend=attn_backend,
                     op_impl=op_impl,
                     rotary_type=self.rotary_type,
@@ -701,27 +705,45 @@ class TransformerHFLlama(Transformer):
             ),
         )
         if not getattr(self.params, "tie_word_embeddings", False):
-            self.lm_head = ColumnParallelLinear(
+            self.lm_head = LmHeadColumnParallelLinear(
                 self.params.dim,
                 self.params.vocab_size,
+                decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
                 has_bias=False,
                 checkpoint_prefix=f"lm_head",
             )
         elif not getattr(self, "embed_tokens", None):
             self.embed_tokens = VocabParallelEmbedding(
-                num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
+                num_embeddings=self.params.vocab_size,
+                embedding_dim=self.params.dim,
+                decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
             )
 
     def _pre_layers(self, h, **args):
-        return self.embed_tokens(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            return self.embed_tokens(
+                h, self.global_embed_num_tokens, self.embed_tokens_cum_num_tokens
+            )
+        else:
+            return self.embed_tokens(h)
 
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h, impl=get_rms_norm_impl())
         if not getattr(self.params, "tie_word_embeddings", False):
-            h = self.lm_head(h)
+            if self.specialize_embed_tokens_lm_head_parallel:
+                h = self.lm_head(
+                    h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+                )
+            else:
+                h = self.lm_head(h)
         else:
-            h = self.embed_tokens.forward_as_lm_head(h)
+            if self.specialize_embed_tokens_lm_head_parallel:
+                h = self.embed_tokens.forward_as_lm_head(
+                    h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+                )
+            else:
+                h = self.embed_tokens.forward_as_lm_head(h)
         return h
 
     def precompute_freqs_cis(
@@ -759,14 +781,10 @@ class TransformerHFLlama(Transformer):
     def prepare_freqs_cis(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.rotary_emb.cos_cached[
-                self.cache_managers[
-                    "main"
-                ].seq_len_delta.delta_position_ids_tensor_device
+                self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             ],
             self.rotary_emb.sin_cached[
-                self.cache_managers[
-                    "main"
-                ].seq_len_delta.delta_position_ids_tensor_device
+                self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             ],
         )
 
@@ -774,12 +792,12 @@ class TransformerHFLlama(Transformer):
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.rotary_emb.cos_cached[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
             self.rotary_emb.sin_cached[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
