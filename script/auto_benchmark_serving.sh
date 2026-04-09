@@ -18,12 +18,13 @@
 # Part 1. The variables and functions that you need to check and modify carefully.
 # Part 1. 你需要仔细检查和修改的变量和函数
 SERVER_LOG_FILE="chitu_run.log"
-MODEL_NAME="Qwen3-32B"
+# MODEL_NAME="Qwen3-32B"
+MODEL_NAME="LLaDA2.0-mini"
 
 run_server(){
-    SERVE_JOB_NAME="run_serve" # rename "run_serve" (with a unique name) to prevent conflicts
-    SLURM_PARTITION=debug
-    NUM_GPUS=1
+    SERVE_JOB_NAME="run_serve_tp8" # Changed to a unique name for TP=2 run
+    SLURM_PARTITION=long
+    NUM_GPUS=8                # 用2张卡跑TP=2
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
@@ -47,14 +48,14 @@ run_server(){
         HYDRA_FULL_ERROR=1 \
         torchrun \
             --nnodes=\$NUM_NODES \
-            --nproc_per_node=1 \
+            --nproc_per_node=8 \
             -m chitu \
             serve.port=21002 \
             infer.pp_size=1 \
-            infer.tp_size=1 \
+            infer.tp_size=8 \
             infer.cache_type=paged \
-            models=Qwen3-32B \
-            models.ckpt_dir=/data/nfs/Qwen3-32B \
+            models=LLaDA2.0-mini \
+            models.ckpt_dir=/data/nfs/LLaDA2.1-mini \
             infer.use_cuda_graph=True \
             infer.max_batch_size=256 \
             infer.max_seq_len=2048 \
@@ -65,7 +66,8 @@ run_server(){
 run_benchmark(){
     local host_name=$1
     local temp_file=$(mktemp)
-    for bsz in 1 2 4 8 16 32 64 128 256
+    # for bsz in 1 2 4 8 16 32 64 128 256
+    for bsz in 16
     do
         python benchmarks/benchmark_serving.py \
             --batch-size $bsz \
@@ -75,6 +77,9 @@ run_benchmark(){
             --output-len 1024 \
             --warmup 1 \
             --base-url http://${host_name}:21002 \
+            --output-dir "./results" \
+            --dataset sharegpt \
+            --dataset-path /data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json \
             2>&1 | stdbuf -o0 tee "$temp_file"  # Do not delete
 
         # Extract result from temp_file, Do not delete

@@ -26,6 +26,9 @@ from chitu.task import (
     SerializedPackedTasksPayloadType,
     TaskCollector,
 )
+from chitu.async_response import AsyncResponse
+from chitu.global_vars import get_global_args
+from chitu.models.registry import ModelType
 from chitu.task_type import TaskType
 
 logger = getLogger(__name__)
@@ -361,9 +364,20 @@ def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
     return chat_template_kwargs
 
 
+def infermode_for_current_model() -> str:
+    """LLADA / diffusion LLM 使用 diffusionllm，其余为自回归。"""
+    args = get_global_args()
+    return "diffusionllm" if (args.models.type == ModelType.LLADA2) else "autoregressive"
+
+
 def submit_request(req: UserRequest) -> AsyncResponse:
+    infermode = infermode_for_current_model()
     task = Task(
-        req.request_id, req, stop_with_eos=req.stop_with_eos, priority=req.priority
+        req.request_id,
+        req,
+        stop_with_eos=req.stop_with_eos,
+        priority=req.priority,
+        infermode=infermode,
     )
     TaskPool.enqueue(task)
     return AsyncResponse(req)

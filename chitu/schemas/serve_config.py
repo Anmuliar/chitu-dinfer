@@ -87,6 +87,7 @@ class InferConfig(InferConfigLegacy):
     num_experts_slots: Optional[int] = None
     moe_lb_trigger: int = -1
     moe_lb_threshold: float = 3.0
+    dllm_block_length: int = 32  # block length for dLLM decode
     enable_prefix_caching: bool = MISSING
 
     @dataclass

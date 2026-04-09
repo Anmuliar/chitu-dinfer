@@ -34,12 +34,12 @@ from chitu.models.model_hf_llama import FeedForwardHFLlama
 from chitu.device_type import has_accelerator
 from typing import Any, Optional, cast
 
-from transformers.models.qwen3_5.configuration_qwen3_5 import (
-    Qwen3_5TextConfig as Qwen3_5TextConfig,
-)
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5TextRotaryEmbedding as HFQwen3_5TextRotaryEmbedding,
-)
+# from transformers.models.qwen3_5.configuration_qwen3_5 import (
+#     Qwen3_5TextConfig as Qwen3_5TextConfig,
+# )
+# from transformers.models.qwen3_5.modeling_qwen3_5 import (
+#     Qwen3_5TextRotaryEmbedding as HFQwen3_5TextRotaryEmbedding,
+# )
 
 
 class MTPMixin:

@@ -49,6 +49,7 @@ from chitu.task import (
     TaskCollector,
     DPTaskCollector,
 )
+from chitu.task_type import PREFILL_TYPES, DECODE_TYPES, is_decode
 from chitu.utils import (
     gen_req_id,
     try_import_opt_dep,
@@ -370,6 +371,7 @@ def _warmup_via_taskpool(args):
         )
         warmup_seq_len = 1
         prefill_chunk_size = args.infer.max_seq_len * args.infer.max_batch_size
+    infermode = "diffusionllm" if (args.models.type == ModelType.LLADA2) else "autoregressive"
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
@@ -379,7 +381,7 @@ def _warmup_via_taskpool(args):
                 temperature=0.7,
                 top_k=1,
             )
-            task = Task(f"{req.request_id}", req, stop_with_eos=False)
+            task = Task(f"{req.request_id}", req, stop_with_eos=False, infermode=infermode)
             TaskPool.add(task)
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
         for scheduler in Backend.schedulers:
@@ -430,7 +432,7 @@ def _warmup_via_taskpool(args):
             prefill_remaining = sum(
                 1
                 for task in TaskPool.pool.values()
-                if task.task_type == TaskType.Prefill
+                if task.task_type in PREFILL_TYPES
             )
             if prefill_remaining == 0:
                 break
@@ -963,9 +965,9 @@ def chitu_run_main_rank():
         random.shuffle(id_and_scheduler_list)
 
         task_type = (
-            TaskType.Prefill
+            PREFILL_TYPES
             if any(scheduler.can_prefill() for scheduler in Backend.schedulers)
-            else TaskType.Decode
+            else DECODE_TYPES
         )
         _last_step_task_type = task_type
         task_ids_list = [None] * len(id_and_scheduler_list)
@@ -979,7 +981,7 @@ def chitu_run_main_rank():
                     task = TaskPool.pool.get(task_id)
                     if task is None:
                         continue
-                    if getattr(task, "task_type", None) != TaskType.Decode:
+                    if not is_decode(getattr(task, "task_type", None)):
                         continue
                     if getattr(task, "pd_sched_wait_end_logged", False):
                         continue
@@ -998,7 +1000,7 @@ def chitu_run_main_rank():
                 task = TaskPool.pool.get(task_id)
                 if task is None:
                     continue
-                if getattr(task, "task_type", None) != TaskType.Decode:
+                if not is_decode(getattr(task, "task_type", None)):
                     continue
                 if getattr(task, "pd_sched_wait_end_logged", False):
                     continue

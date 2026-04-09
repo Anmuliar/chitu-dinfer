@@ -30,6 +30,7 @@ from chitu.attn_backend import (
     TritonAttnBackend,
     NpuAttnBackend,
     HybridAttnBackend,
+    DLLMAttnBackend,
 )
 
 from chitu.kv_cache.registry import should_use_hopper_mixed_backend
@@ -68,6 +69,7 @@ from chitu.tokenizer import (
     ChatFormat,
     ChatFormatHF,
     ChatFormatHF_dsv32,
+    ChatFormatLLaDA,
     Tokenizer,
     TokenizerHF,
     Processor,
@@ -344,6 +346,9 @@ class Backend:
         Backend.ip_port_list = world_group.gather_all_rank_ip_port()
         Backend.ipc_session_id = world_group.generate_ipc_session_id()
 
+        # sglang parallel state for dLLM (LLaDA2) is initialized in model_llada.py
+        # when TransformerLLaDA is instantiated
+
         Backend.pp_stage = (
             global_rank
             % (world_size // non_expert_data_parallel_size)
@@ -457,6 +462,8 @@ class Backend:
         chatformat_type = getattr(args.models, "chatformat_type", tokenizer_type)
         if chatformat_type == "dsv32":
             return ChatFormatHF_dsv32(Backend.tokenizer, Backend.processor)
+        elif chatformat_type == "llada":
+            return ChatFormatLLaDA(Backend.tokenizer, Backend.processor)
         elif chatformat_type == "hf":
             return ChatFormatHF(Backend.tokenizer, Backend.processor)
         else:
@@ -484,6 +491,8 @@ class Backend:
             return FlashMLABackend
         elif args.infer.attn_type == "flash_infer":
             return FlashInferBackend
+        elif args.infer.attn_type == "dllm":
+            return DLLMAttnBackend
         elif args.infer.attn_type == "triton":
             return TritonAttnBackend
         elif args.infer.attn_type == "npu":
@@ -591,7 +600,6 @@ class Backend:
             # Build the model. Don't allocate memory yet.
             with torch.device("meta"):
                 model = Backend._build_model_architecture(args, attn_backend)
-
             # Load model parameters
             Backend._load_checkpoint(model, args)
 
@@ -751,7 +759,6 @@ class Backend:
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
             load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, args)
-
         else:
             quant_config = getattr(args.models, "quant_config", None)
             quant_name = getattr(quant_config, "name", None)
@@ -791,6 +798,7 @@ class Backend:
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
+                ModelType.LLADA2,
             }:
                 if Backend._support_layerwise_loading():
                     checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)

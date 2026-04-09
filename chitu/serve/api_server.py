@@ -22,7 +22,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
-from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
