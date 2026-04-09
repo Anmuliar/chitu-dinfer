@@ -14,7 +14,7 @@ from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend, DLLMAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.dllm.decoder import DLLMDecoder
 from chitu.task_type import TaskType
@@ -441,7 +441,7 @@ class TransformerBlockLLaDA2(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type,
@@ -449,13 +449,13 @@ class TransformerBlockLLaDA2(TransformerBlock):
         checkpoint_prefix,
     ):
         super().__init__(
-            layer_id, args, cache_managers, attn_backend=attn_backend, op_impl=op_impl
+            layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
         )
         self.layer_id = layer_id
         self.attention = AttentionLLaDA2(
             args,
             layer_id,
-            cache_managers["main"],
+            cache_dict["main"],
             attn_backend,
             op_impl=op_impl,
             checkpoint_prefix=f"{checkpoint_prefix}.attention",
@@ -529,7 +529,7 @@ class TransformerLLaDA2(TransformerHFLlama):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -557,7 +557,7 @@ class TransformerLLaDA2(TransformerHFLlama):
         # Call parent initialization
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -794,7 +794,7 @@ class TransformerLLaDA2(TransformerHFLlama):
 
         # Prepare attn_backend
         self.attn_backend.prepare_prefill(
-            cache_managers=self.cache_managers,
+            cache_dict=self.cache_dict,
             num_layers=len(self.layers),
             prefilling_lengths=prefilling_lengths,
             batch_size=batch_size,
@@ -802,8 +802,8 @@ class TransformerLLaDA2(TransformerHFLlama):
         )
 
         # Set seq_len_delta for prepare_freqs_cis
-        for mgr in self.cache_managers.values():
-            mgr.seq_len_delta.copy_from_list(
+        for cache in self.cache_dict.values():
+            cache.seq_len_delta.copy_from_list(
                 [0] * batch_size,  # old_lens
                 prefilling_lengths,  # new_lens
             )
@@ -846,7 +846,7 @@ class TransformerLLaDA2(TransformerHFLlama):
 
         # Prepare attn_backend
         self.attn_backend.prepare_decode(
-            cache_managers=self.cache_managers,
+            cache_dict=self.cache_dict,
             num_layers=len(self.layers),
             decoding_start=decoding_start,
             block_length=block_length,
@@ -859,8 +859,8 @@ class TransformerLLaDA2(TransformerHFLlama):
 
         # Set seq_len_delta for prepare_freqs_cis
         new_lens = decoding_start + block_length
-        for mgr in self.cache_managers.values():
-            mgr.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
+        for cache in self.cache_dict.values():
+            cache.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
 
         # Save state for before_replay callback
         self._decoding_start_for_graph = decoding_start

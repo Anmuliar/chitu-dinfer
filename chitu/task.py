@@ -797,6 +797,9 @@ class Task:
                 # 尚未进行推理，但可能被prefix caching击中
                 return self.num_cached_blocks * self.token_blocks[0].blk_size if self.token_blocks else 0
         elif is_decode(self.task_type):
+            # For DLLM decode, use decoding_start as cached length
+            if self.task_type == TaskType.DecodeDLLM:
+                return self.decoding_start
             return self.prefix_tokens_len - 1
         else:
             assert False
@@ -807,6 +810,12 @@ class Task:
         if is_prefill(self.task_type):
             return self.consumed_req_tokens + self.next_req_tokens_len
         elif is_decode(self.task_type):
+            # For DLLM decode, need decoding_start + block_length
+            if self.task_type == TaskType.DecodeDLLM:
+                return min(
+                    self.decoding_start + self.block_length,
+                    get_global_args().infer.max_seq_len,
+                )
             return min(
                 self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size,
                 get_global_args().infer.max_seq_len,

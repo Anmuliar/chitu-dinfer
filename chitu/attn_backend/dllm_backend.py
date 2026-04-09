@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import DenseKVCacheAccessor, PagedKVCacheAccessor
+from chitu.kv_cache import DenseKVCacheAccessor, PagedKVCacheAccessor, PagedKVCache
 from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
 from chitu.static_tensor import StaticTensor
 from chitu.utils import try_import_opt_dep
@@ -24,7 +24,7 @@ class DLLMAttnBackend(FlashAttnBackend):
 
     def __init__(self):
         super().__init__()
-        self._cache_managers = None
+        self._cache_dict = None
         self._block_length = None
         self._is_prefill = True
         self._num_layers = None
@@ -42,14 +42,14 @@ class DLLMAttnBackend(FlashAttnBackend):
 
     def prepare_prefill(
         self,
-        cache_managers,
+        cache_dict: dict[str, "PagedKVCache"],
         num_layers: int,
         prefilling_lengths: list[int],
         batch_size: int,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         self._is_prefill = True
-        self._cache_managers = cache_managers
+        self._cache_dict = cache_dict
         self._num_layers = num_layers
         self._prefilling_lengths = prefilling_lengths
         self._batch_size = batch_size
@@ -57,7 +57,7 @@ class DLLMAttnBackend(FlashAttnBackend):
 
     def prepare_decode(
         self,
-        cache_managers,
+        cache_dict: dict[str, "PagedKVCache"],
         num_layers: int,
         decoding_start: torch.Tensor,
         block_length: int,
@@ -68,7 +68,7 @@ class DLLMAttnBackend(FlashAttnBackend):
         dtype: Optional[torch.dtype] = None,
     ):
         self._is_prefill = False
-        self._cache_managers = cache_managers
+        self._cache_dict = cache_dict
         self._num_layers = num_layers
         self._decoding_start = decoding_start
         self._block_length = block_length
@@ -208,20 +208,15 @@ class DLLMAttnBackend(FlashAttnBackend):
                 offset += ds
 
         # Read and scatter historical KV from paged cache
-        for layer_id in range(self._num_layers):
-            for mgr in self._cache_managers.values():
-                try:
-                    accessor = mgr.get_accessor(layer_id)
-                    break
-                except KeyError:
-                    continue
-            else:
-                continue
+        main_cache = self._cache_dict.get("main")
+        if main_cache is not None:
+            for layer_id in range(self._num_layers):
+                accessor = main_cache.get_accessor(layer_id)
 
-            past_k = read_from_paged_kv_cache(accessor.k, accessor.block_table, position_ids, seq_ids)
-            past_v = read_from_paged_kv_cache(accessor.v, accessor.block_table, position_ids, seq_ids)
-            full_k[layer_id, seq_ids, :, position_ids, :] = past_k
-            full_v[layer_id, seq_ids, :, position_ids, :] = past_v
+                past_k = read_from_paged_kv_cache(accessor.k, accessor.block_table, position_ids, seq_ids)
+                past_v = read_from_paged_kv_cache(accessor.v, accessor.block_table, position_ids, seq_ids)
+                full_k[layer_id, seq_ids, :, position_ids, :] = past_k
+                full_v[layer_id, seq_ids, :, position_ids, :] = past_v
 
     def _decode_attention_graph_safe(
         self,
@@ -436,20 +431,20 @@ class DLLMAttnBackend(FlashAttnBackend):
             delta_seq_ids[start:end] = idx
 
         kv_size = batch_size * block_length
+        main_cache = self._cache_dict.get("main")
+        if main_cache is None:
+            return
+
         for layer_id in range(self._num_layers):
             layer_k = self._decode_kv_cache[layer_id, 0, :kv_size]
             layer_v = self._decode_kv_cache[layer_id, 1, :kv_size]
 
-            for mgr in self._cache_managers.values():
-                try:
-                    accessor = mgr.get_accessor(layer_id)
-                except KeyError:
-                    continue
+            accessor = main_cache.get_accessor(layer_id)
 
-                finished_k = layer_k.view(batch_size, block_length, n_kv_heads, head_dim)[finished_indices]
-                finished_v = layer_v.view(batch_size, block_length, n_kv_heads, head_dim)[finished_indices]
-                for tensor, name in [(finished_k, 'k'), (finished_v, 'v')]:
-                    append_to_paged_kv_cache(
-                        getattr(accessor, name), accessor.block_table, tensor.reshape(-1, n_kv_heads, head_dim).contiguous(),
-                        delta_position_ids, delta_seq_ids,
-                        get_page_ids=accessor.get_page_ids, get_offs_in_page=accessor.get_offs_in_page, use_i64_offsets=accessor.use_i64_offsets)
+            finished_k = layer_k.view(batch_size, block_length, n_kv_heads, head_dim)[finished_indices]
+            finished_v = layer_v.view(batch_size, block_length, n_kv_heads, head_dim)[finished_indices]
+            for tensor, name in [(finished_k, 'k'), (finished_v, 'v')]:
+                append_to_paged_kv_cache(
+                    getattr(accessor, name), accessor.block_table, tensor.reshape(-1, n_kv_heads, head_dim).contiguous(),
+                    delta_position_ids, delta_seq_ids,
+                    get_page_ids=accessor.get_page_ids, get_offs_in_page=accessor.get_offs_in_page, use_i64_offsets=accessor.use_i64_offsets)

@@ -421,19 +421,58 @@ class KVCacheBase:
     def finalize_cache_single_decode(self, req_ids: list[str]):
         self.curr_req_ids = None
 
+    def prepare_cache_prefill_dllm(
+        self,
+        tasks: "PackedTasksBase",
+        prefilling_lengths: list[int],
+    ):
+        """Prepare cache for DLLM prefill.
+
+        DLLM prefill uses truncated prompt lengths (aligned to block_length).
+        This method sets up seq_len_delta based on prefilling_lengths.
+
+        Args:
+            tasks: PackedTasks containing task information
+            prefilling_lengths: Actual prefilling lengths for each task (truncated to block boundary)
+        """
+        self.curr_tids = tasks.task_ids
+
+        # DLLM prefill starts from 0, ends at prefilling_lengths
+        prev_seq_len = BatchedSeqLen(
+            [0] * len(tasks.task_ids),
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        next_seq_len = BatchedSeqLen(
+            prefilling_lengths,
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
+
+        for tid, seq_len in zip(tasks.task_ids, prefilling_lengths):
+            self.tid_to_cached_len[tid] = seq_len
+
     def prepare_cache_decode_dllm(
-        self, req_ids: list[str], decoding_start: torch.Tensor, block_length: int
+        self,
+        tasks: "PackedTasksBase",
+        decoding_start: torch.Tensor,
+        block_length: int,
     ):
         """Prepare cache for DLLM decode. Override in PagedKVCache."""
-        self.curr_req_ids = req_ids
+        self.curr_req_ids = tasks.task_ids
 
     def finalize_cache_single_decode_dllm(
         self, req_ids: list[str], block_finished: torch.Tensor, block_length: int
     ):
-        """Finalize DLLM decode: update req_id_to_seq_len for finished blocks."""
+        """Finalize DLLM decode: update tid_to_cached_len for finished blocks."""
         finished_indices = block_finished.nonzero(as_tuple=True)[0].tolist()
         for idx in finished_indices:
-            self.req_id_to_seq_len[req_ids[idx]] += block_length
+            self.tid_to_cached_len[req_ids[idx]] += block_length
         self.curr_req_ids = None
 
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
@@ -633,6 +672,48 @@ class PagedKVCache(KVCacheBase):
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
 
+    def prepare_cache_prefill_dllm(
+        self,
+        tasks: "PackedTasksBase",
+        prefilling_lengths: list[int],
+    ):
+        """Prepare cache for DLLM prefill.
+
+        Similar to prepare_cache_prefill, but uses prefilling_lengths for seq_len_delta.
+        DLLM prefill truncates prompts to block boundaries.
+
+        Args:
+            tasks: PackedTasks containing new_cache_ids_list
+            prefilling_lengths: Actual prefilling lengths for each task
+        """
+        self.curr_tids = tasks.task_ids
+
+        # Set up seq_len_delta based on prefilling_lengths
+        prev_seq_len = BatchedSeqLen(
+            [0] * len(tasks.task_ids),
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        next_seq_len = BatchedSeqLen(
+            prefilling_lengths,
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
+
+        for tid, seq_len in zip(tasks.task_ids, prefilling_lengths):
+            self.tid_to_cached_len[tid] = seq_len
+
+        # Receive pre-allocated block indices from scheduler
+        if tasks.new_cache_ids_list:
+            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                self.block_table[tid].extend(new_cache_ids)
+        self._upd_gpu_block_table(tasks.task_ids)
+
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
@@ -644,22 +725,25 @@ class PagedKVCache(KVCacheBase):
         self._upd_gpu_block_table(tasks.task_ids)
 
     def prepare_cache_decode_dllm(
-        self, req_ids: list[str], decoding_start: torch.Tensor, block_length: int
+        self,
+        tasks: "PackedTasksBase",
+        decoding_start: torch.Tensor,
+        block_length: int,
     ):
-        """Prepare cache for DLLM decode: reserve blocks for decoding_start + block_length."""
-        self.curr_req_ids = req_ids
+        """Prepare cache for DLLM decode.
+
+        Similar to prepare_cache_decode, this receives new_cache_ids_list from scheduler
+        and updates block_table accordingly.
+        """
+        self.curr_req_ids = tasks.task_ids
         new_lens = decoding_start + block_length
         self.seq_len_delta.copy_from_tensor(decoding_start, new_lens)
 
-        decoding_start_list = decoding_start.tolist()
-        for i, req_id in enumerate(req_ids):
-            target = decoding_start_list[i] + block_length
-            num_additional_blocks = self.num_additional_blocks_req_need(req_id, target)
-            if num_additional_blocks > 0:
-                self.block_table[req_id].extend(
-                    [self.get_free_block() for _ in range(num_additional_blocks)]
-                )
-        self._upd_gpu_block_table(req_ids)
+        # Receive pre-allocated block indices from scheduler (via new_cache_ids_list)
+        if tasks.new_cache_ids_list:
+            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                self.block_table[tid].extend(new_cache_ids)
+        self._upd_gpu_block_table(tasks.task_ids)
 
     def estimate_bytes_per_block(self) -> int:
         """Estimate additional bytes required to allocate 1 more KV page/block.

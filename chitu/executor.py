@@ -1310,8 +1310,9 @@ class Executor:
                 decoding_start = min(((non_mask_number) // block_length) * block_length, 1024)
                 prefilling_lengths.append(decoding_start)
 
-            for mgr in Backend.cache_dict.values():
-                mgr.prepare_cache_prefill(tasks.req_ids, prefilling_lengths)
+            for cache in Backend.cache_dict.values():
+                if hasattr(cache, "prepare_cache_prefill_dllm"):
+                    cache.prepare_cache_prefill_dllm(tasks, prefilling_lengths)
             PrometheusMetricsCollector.update_kvcache_usage()
 
             if (self.rank == 0 and num_tokens > 0) or (self.dp_size > 1 and self.pp_stage == 0):
@@ -1336,8 +1337,6 @@ class Executor:
 
         max_prefilling_length = max(prefilling_lengths) if prefilling_lengths else 0
         if is_empty_step or max_prefilling_length == 0:
-            for mgr in Backend.cache_dict.values():
-                mgr.finalize_cache_all_prefill()
             return self.dummy_output
 
         batch_size = tasks.num_tasks
@@ -1354,8 +1353,6 @@ class Executor:
             prefilling_lengths=prefilling_lengths,
         )
 
-        for mgr in Backend.cache_dict.values():
-            mgr.finalize_cache_all_prefill()
         torch.cuda.synchronize()
         return logits
 
@@ -1398,9 +1395,9 @@ class Executor:
 
         # 3) Prepare cache
         self._kv_hook.before_decode_step(tasks.req_ids)
-        for mgr in Backend.cache_dict.values():
-            if hasattr(mgr, "prepare_cache_decode_dllm"):
-                mgr.prepare_cache_decode_dllm(tasks.req_ids, decoding_start, block_length)
+        for cache in Backend.cache_dict.values():
+            if hasattr(cache, "prepare_cache_decode_dllm"):
+                cache.prepare_cache_decode_dllm(tasks, decoding_start, block_length)
         PrometheusMetricsCollector.update_kvcache_usage()
 
         # 4) Model forward
